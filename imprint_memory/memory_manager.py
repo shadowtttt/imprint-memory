@@ -296,7 +296,7 @@ def remember(content: str, category: str = "general", source: str = "cc",
     for old_id, old_preview, sim in supersede_ids:
         db.execute(
             "UPDATE memories SET superseded_by = ?, updated_at = ? WHERE id = ?",
-            (memory_id, now, old_id),
+            (memory_id, now_str(), old_id),
         )
         supersede_notes.append(f"  ↳ Superseded #{old_id} ({old_preview}… sim {sim:.3f})")
 
