@@ -70,11 +70,12 @@ All via environment variables:
 | `IMPRINT_DATA_DIR` | `~/.imprint/` | Base directory for all data |
 | `IMPRINT_DB` | `$IMPRINT_DATA_DIR/memory.db` | SQLite database path |
 | `TZ_OFFSET` | `0` | Hours offset from UTC (e.g. `12` for NZST) |
-| `EMBED_PROVIDER` | `ollama` | `ollama` or `openai` |
-| `EMBED_MODEL` | auto | Model name (default: `bge-m3` / `text-embedding-3-small`) |
+| `EMBED_PROVIDER` | `ollama` | `ollama`, `openai`, or `google` |
+| `EMBED_MODEL` | auto | Model name (default: `bge-m3` / `text-embedding-3-small` / `gemini-embedding-2`) |
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama endpoint |
 | `OPENAI_API_KEY` | — | For OpenAI-compatible providers |
 | `EMBED_API_BASE` | `https://api.openai.com` | Base URL for OpenAI-compatible API |
+| `GOOGLE_API_KEYS` | — | Comma-separated keys for Google Gemini Embedding (or `GOOGLE_API_KEY` for a single key) |
 
 ### Embedding providers
 
@@ -91,6 +92,11 @@ export EMBED_PROVIDER=openai OPENAI_API_KEY=sk-...
 **Any OpenAI-compatible API** (Voyage AI, Azure, etc.):
 ```bash
 export EMBED_PROVIDER=openai OPENAI_API_KEY=... EMBED_API_BASE=https://... EMBED_MODEL=...
+```
+
+**Google Gemini Embedding** — supports text + image (multimodal):
+```bash
+export EMBED_PROVIDER=google GOOGLE_API_KEYS=key1,key2  # comma-separated for round-robin
 ```
 
 No embedding provider? Falls back to FTS5 keyword search only — still works, just less semantic.

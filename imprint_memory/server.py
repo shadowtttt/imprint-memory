@@ -494,8 +494,30 @@ def _run_http():
     anyio.run(server.serve)
 
 
+def _print_embed_config() -> None:
+    """Log the active embedding provider so misconfiguration is visible at startup."""
+    from .memory_manager import (
+        EMBED_PROVIDER, EMBED_MODEL, OLLAMA_URL,
+        EMBED_API_BASE, OPENAI_API_KEY, GOOGLE_API_KEYS,
+    )
+    if EMBED_PROVIDER == "ollama":
+        detail = f"url={OLLAMA_URL}"
+    elif EMBED_PROVIDER == "openai":
+        detail = f"base={EMBED_API_BASE}, key={'set' if OPENAI_API_KEY else 'MISSING'}"
+    elif EMBED_PROVIDER == "google":
+        detail = f"keys={len(GOOGLE_API_KEYS) or 'MISSING'}"
+    else:
+        detail = "unknown provider"
+    print(
+        f"[imprint-memory] embedding: provider={EMBED_PROVIDER}, model={EMBED_MODEL}, {detail}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def main():
     """Entry point for console script and direct execution."""
+    _print_embed_config()
     if is_http:
         _run_http()
     else:

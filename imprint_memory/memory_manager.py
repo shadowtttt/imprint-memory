@@ -11,6 +11,7 @@ import os
 import re
 import sqlite3
 import struct
+import sys
 import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -24,7 +25,7 @@ from .db import (
 )
 
 # ─── Embedding Config ────────────────────────────────────
-EMBED_PROVIDER = os.environ.get("EMBED_PROVIDER", "google")  # "google", "ollama", or "openai"
+EMBED_PROVIDER = os.environ.get("EMBED_PROVIDER", "ollama")  # "ollama", "google", or "openai"
 
 # Ollama settings
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
@@ -59,6 +60,23 @@ WEIGHT_VECTOR = 0.4
 WEIGHT_FTS = 0.4
 WEIGHT_RECENCY = 0.2
 
+# Track which providers have already logged a failure, so we warn once per cause
+# instead of spamming stderr on every memory write/search.
+_warned_embed: set[str] = set()
+
+
+def _warn_embed_once(provider: str, reason: str) -> None:
+    key = f"{provider}:{reason}"
+    if key in _warned_embed:
+        return
+    _warned_embed.add(key)
+    print(
+        f"[imprint-memory] embedding provider '{provider}' failed: {reason}. "
+        f"Vector search disabled; falling back to FTS5 keyword only.",
+        file=sys.stderr,
+        flush=True,
+    )
+
 
 # ─── Vector Embeddings ───────────────────────────────────
 
@@ -76,8 +94,9 @@ def _embed_ollama(text: str) -> Optional[list[float]]:
             embeddings = data.get("embeddings", [])
             if embeddings and len(embeddings[0]) > 0:
                 return embeddings[0]
-    except Exception:
-        pass
+            _warn_embed_once("ollama", f"empty response from {OLLAMA_URL} (model '{EMBED_MODEL}' pulled?)")
+    except Exception as e:
+        _warn_embed_once("ollama", f"{type(e).__name__}: {e} (URL={OLLAMA_URL}, model={EMBED_MODEL})")
     return None
 
 
@@ -86,6 +105,7 @@ def _embed_openai(text: str) -> Optional[list[float]]:
     Works with: OpenAI, Voyage AI, Azure OpenAI, any OpenAI-compatible service.
     Set EMBED_API_BASE to point to your provider."""
     if not OPENAI_API_KEY:
+        _warn_embed_once("openai", "OPENAI_API_KEY not set")
         return None
     try:
         url = f"{EMBED_API_BASE.rstrip('/')}/v1/embeddings"
@@ -103,8 +123,9 @@ def _embed_openai(text: str) -> Optional[list[float]]:
             items = data.get("data", [])
             if items and "embedding" in items[0]:
                 return items[0]["embedding"]
-    except Exception:
-        pass
+            _warn_embed_once("openai", f"empty response from {EMBED_API_BASE} (model={EMBED_MODEL})")
+    except Exception as e:
+        _warn_embed_once("openai", f"{type(e).__name__}: {e} (base={EMBED_API_BASE}, model={EMBED_MODEL})")
     return None
 
 
@@ -123,6 +144,7 @@ def _embed_google(text: str, image_path: Optional[str] = None) -> Optional[list[
     Supports text and optional image (multimodal)."""
     api_key = _next_google_key()
     if not api_key:
+        _warn_embed_once("google", "no API key (set GOOGLE_API_KEYS or GOOGLE_API_KEY)")
         return None
     try:
         url = (
@@ -157,8 +179,9 @@ def _embed_google(text: str, image_path: Optional[str] = None) -> Optional[list[
             values = embedding.get("values", [])
             if values:
                 return values
-    except Exception:
-        pass
+            _warn_embed_once("google", f"empty response (model={EMBED_MODEL})")
+    except Exception as e:
+        _warn_embed_once("google", f"{type(e).__name__}: {e} (model={EMBED_MODEL})")
     return None
 
 
