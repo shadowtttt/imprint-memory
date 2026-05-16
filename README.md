@@ -115,8 +115,8 @@ All configuration is via environment variables. Defaults are chosen for local, p
 | `IMPRINT_USER_NAME` | `User` | Human speaker label used in summaries and chunk expansion. |
 | `IMPRINT_AGENT_NAME` | `Assistant` | Assistant speaker label used in summaries and chunk expansion. |
 | `IMPRINT_LOCALE` | `en` | Search output labels: `en` or `zh`. |
-| `EMBED_PROVIDER` | `ollama` | Embedding provider: `ollama`, `openai`, or `google`. |
-| `EMBED_MODEL` | provider default | Embedding model. Defaults: `bge-m3`, `text-embedding-3-small`, or `gemini-embedding-2`. |
+| `EMBED_PROVIDER` | `ollama` | Embedding provider: `ollama`, `openai`, `google`, or `cloudflare`. |
+| `EMBED_MODEL` | provider default | Embedding model. Defaults: `bge-m3`, `text-embedding-3-small`, `gemini-embedding-2`, or `@cf/baai/bge-large-en-v1.5`. |
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama base URL for embeddings. |
 | `OPENAI_API_KEY` | unset | API key for OpenAI or OpenAI-compatible embedding providers. |
 | `EMBED_API_BASE` | `https://api.openai.com` | Base URL for OpenAI-compatible embedding APIs. |

@@ -53,6 +53,7 @@ _DEFAULT_MODELS = {
     "ollama": "bge-m3",
     "openai": "text-embedding-3-small",
     "google": "gemini-embedding-2",
+    "cloudflare": "@cf/baai/bge-large-en-v1.5",
 }
 EMBED_MODEL = os.environ.get("EMBED_MODEL", _DEFAULT_MODELS.get(EMBED_PROVIDER, "bge-m3"))
 
@@ -339,6 +340,34 @@ def _embed_google(text: str, image_path: Optional[str] = None) -> Optional[list[
     return None
 
 
+def _embed_cloudflare(text: str) -> Optional[list[float]]:
+    """Generate embedding via Cloudflare Workers AI."""
+    account_id = os.environ.get("CF_ACCOUNT_ID", "")
+    api_token = os.environ.get("CF_API_TOKEN", "")
+    if not account_id or not api_token:
+        return None
+    try:
+        url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{EMBED_MODEL}"
+        payload = json.dumps({"text": [text]}).encode()
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_token}",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+            result = data.get("result", {})
+            vectors = result.get("data", [])
+            if vectors and len(vectors) > 0:
+                return vectors[0]
+    except Exception:
+        pass
+    return None
+
+
 def _embed(text: str, image_path: Optional[str] = None) -> Optional[list[float]]:
     """Generate an embedding vector, falling back to Ollama and then keyword-only search.
 
@@ -354,6 +383,8 @@ def _embed(text: str, image_path: Optional[str] = None) -> Optional[list[float]]
             vec = _embed_google(text, image_path=image_path)
         elif provider == "openai":
             vec = _embed_openai(text)
+        elif provider == "cloudflare":
+            vec = _embed_cloudflare(text)
         elif provider == "ollama":
             vec = _embed_ollama(text)
         else:
