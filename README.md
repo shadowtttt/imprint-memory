@@ -131,6 +131,10 @@ OAuth credentials via `~/.imprint-oauth.json` or env vars (`OAUTH_CLIENT_ID`, `O
 
 If you also want multi-channel messaging (Telegram, etc.), Claude.ai integration, heartbeat automation, a dashboard, and scheduled tasks, see the full system: [claude-imprint](https://github.com/Qizhan7/claude-imprint). It installs imprint-memory as a dependency.
 
+## Companion: claude.ai conversation sync
+
+[imprint-chat-sync](https://github.com/Qizhan7/imprint-chat-sync) is a small Chrome extension that pulls your conversations (including `<thinking>` blocks) from claude.ai using your browser session and POSTs them to this server's `/api/ingest` endpoint. Useful if you want long-term recall across both Claude Code and Claude.ai sessions.
+
 ## License
 
 MIT
