@@ -133,7 +133,64 @@ If you also want multi-channel messaging (Telegram, etc.), Claude.ai integration
 
 ## Companion: claude.ai conversation sync
 
-[imprint-chat-sync](https://github.com/Qizhan7/imprint-chat-sync) is a small Chrome extension that pulls your conversations (including `<thinking>` blocks) from claude.ai using your browser session and POSTs them to this server's `/api/ingest` endpoint. Useful if you want long-term recall across both Claude Code and Claude.ai sessions.
+The chat-sync pipeline lets you ingest conversations from anywhere (browser, scripts, other tools) into the same memory database:
+
+```
+imprint-chat-sync (browser ext)  ──POST──>  imprint-memory-receiver  ──>  memory.db
+                                             (auto embed + chunk + edges)
+```
+
+**1. Run the receiver** (needs `imprint-memory[http]`):
+
+```bash
+pip install 'imprint-memory[http]'
+imprint-memory-receiver              # listens on 127.0.0.1:8001
+# or:  PORT=9001 imprint-memory-receiver --no-backfill
+```
+
+Endpoints:
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/api/ingest` | Submit messages — `{ conversation_id, messages: [{ direction, content, ... }] }` |
+| `GET`  | `/api/health` | Liveness check |
+| `GET`  | `/api/status` | Recent count + embedded vector count |
+
+The receiver embeds new messages in the background and runs incremental chunking → topic summaries → graph edges, so search results stay rich.
+
+**2. Browser extension**: [imprint-chat-sync](https://github.com/Qizhan7/imprint-chat-sync) — pulls conversations (including `<thinking>` blocks) from claude.ai using your browser session and POSTs to this receiver.
+
+## Surfacing hook (recall as you type)
+
+`hooks/memory-check.sh` is a [UserPromptSubmit](https://docs.anthropic.com/en/docs/claude-code/hooks) hook that scans each message for recall-worthy signals (time references, emotion, "remember"...) and, if any are found, calls `surfacing_search()` to inject a `<recall>` block with the most relevant memory chunks plus one graph-linked neighbor. It always appends a `<memory-check>` reminder so the model knows to dig deeper when the turn touches the past.
+
+**Install:**
+
+```bash
+cp hooks/memory-check.sh ~/.claude/hooks/memory-check.sh
+chmod +x ~/.claude/hooks/memory-check.sh
+```
+
+Add to `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "bash $HOME/.claude/hooks/memory-check.sh" }] }
+    ]
+  }
+}
+```
+
+**Hook environment variables:**
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `IMPRINT_PYTHON` | Python interpreter to use | `python3` |
+| `IMPRINT_DATA_DIR` | Where `memory.db` lives | `~/.imprint` |
+| `IMPRINT_ENV_FILE` | Path to a `KEY=VALUE` file (e.g. for `GOOGLE_API_KEY`, `CF_API_TOKEN`) | falls back to `~/.imprint/.env` if it exists |
+| `IMPRINT_HOOK_LANG` | Prompt language: `en` or `zh` | `en` |
 
 ## License
 

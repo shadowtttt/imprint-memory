@@ -2132,8 +2132,13 @@ _LOCALE_LABELS = {
            "empty": "没有找到匹配的结果"},
 }
 
+# jionlp prints a sponsor message to stdout on import — swallow it so it
+# doesn't pollute hook output, MCP stdio, or scripts that pipe our stdout.
 try:
-    import jionlp as _jio
+    import contextlib
+    import io as _io
+    with contextlib.redirect_stdout(_io.StringIO()):
+        import jionlp as _jio
     _JIO_OK = True
 except ImportError:
     _jio = None
