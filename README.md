@@ -177,9 +177,6 @@ All configuration is via environment variables. Defaults are chosen for local, p
 | `search_telegram` | Convenience search over `telegram` and `heartbeat` platforms. |
 | `search_channel` | Search any named conversation platform. |
 | `message_bus_read` / `message_bus_post` | Read or write the shared message timeline. |
-| `cc_execute` | Submit an asynchronous local Claude Code task. |
-| `cc_check` | Poll task status and retrieve result/session ID. |
-| `cc_tasks` | List recent Claude Code tasks. |
 | `experience_append` | Append a technical note to `memory/bank/experience.md`. |
 
 ## Receiver API Reference

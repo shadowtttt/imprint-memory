@@ -32,7 +32,8 @@ from .memory_manager import (
     build_stopwords, list_stopwords, add_stopword, remove_stopword,
 )
 from .bus import bus_post, bus_format
-from .tasks import submit_task, check_task, list_tasks
+# Task tools (cc_execute/cc_check/cc_tasks) removed from public release —
+# they are an agent orchestration feature unrelated to memory/search.
 from .conversation import search_conversations, format_search_results
 from .db import DATA_DIR
 
@@ -370,59 +371,6 @@ def search_channel(query: str, channel: str, limit: int = 20) -> str:
     return format_search_results(results)
 
 
-# --- CC Task Tools ----------------------------------------------------
-
-@mcp.tool()
-def cc_execute(prompt: str, session_id: str = "") -> str:
-    """Run a task on the local Claude Code instance (writes code, runs scripts, git ops, etc).
-    The task runs async — call cc_check(task_id) to poll for results.
-
-    MULTI-TURN: To continue a previous CC session (so CC remembers prior context),
-    pass the session_id returned by cc_check. Without session_id, a fresh CC session starts.
-
-    Workflow:
-      1. cc_execute("do X") → get task_id
-      2. cc_check(task_id) → get result + session_id
-      3. cc_execute("now do Y", session_id="...") → continues same CC session"""
-    result = submit_task(prompt=prompt, source="chat", session_id=session_id)
-    bus_post("cc_task", "out", f"[Task submitted] {prompt[:150]}")
-    return f"{result['message']}\nUse cc_check(task_id={result['task_id']}) to get results and session_id"
-
-
-@mcp.tool()
-def cc_check(task_id: int) -> str:
-    """Check CC task status and results. Returns session_id for multi-turn follow-ups.
-    If status is 'running', wait a few seconds and check again."""
-    result = check_task(task_id)
-    if "error" in result:
-        return f"Error: {result['error']}"
-    lines = [f"Task #{result['task_id']}", f"Status: {result['status']}"]
-    if result.get('session_id'):
-        lines.append(f"Session ID: {result['session_id']}")
-    lines.append(f"Created: {result['created_at']}")
-    if result['started_at']:
-        lines.append(f"Started: {result['started_at']}")
-    if result['completed_at']:
-        lines.append(f"Completed: {result['completed_at']}")
-    if result['result']:
-        lines.append(f"\n--- Result ---\n{result['result']}")
-    else:
-        lines.append("\nStill running... call cc_check again in a few seconds.")
-    return "\n".join(lines)
-
-
-@mcp.tool()
-def cc_tasks(limit: int = 5) -> str:
-    """List recent CC tasks with their status and session IDs."""
-    task_list = list_tasks(limit=limit)
-    if not task_list:
-        return "No tasks"
-    lines = []
-    for t in task_list:
-        icon = {"pending": "waiting", "running": "running", "completed": "done", "error": "error", "timeout": "timeout"}.get(t["status"], "?")
-        sid = f" sid={t['session_id'][:8]}..." if t.get("session_id") else ""
-        lines.append(f"[{icon}] #{t['task_id']} [{t['status']}]{sid} {t['prompt']}")
-    return "\n".join(lines)
 
 
 @mcp.tool()
