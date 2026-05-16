@@ -1,196 +1,299 @@
 # imprint-memory
 
-Persistent memory system for [Claude Code](https://docs.anthropic.com/en/docs/claude-code). Gives Claude long-term memory that survives across conversations.
+Local long-term memory for Claude Code users who want searchable, private recall across notes, conversations, and Claude.ai history.
 
-Built as an [MCP server](https://modelcontextprotocol.io/) — works locally (stdio) or remotely via HTTP with OAuth.
+```
+Claude Code ── MCP stdio ───────────────────────────────┐
+                                                        │
+manual memories / daily logs / bank/*.md ───────────────┤
+                                                        ▼
+                                              imprint-memory
+                                         SQLite + FTS5 + vectors
+                                                        │
+claude.ai ── Chrome extension ── POST :8001/api/ingest ─┤
+                                                        ▼
+                            log → embed → chunk → graph edges → search
+                                                        │
+UserPromptSubmit hook ── surfacing_search ── <recall> ──┘
+```
 
-## Features
+## Capabilities
 
-- **Hybrid search** — FTS5 full-text + vector embeddings + exact-match, fused with [RRF](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf) ranking and time-decay scoring
-- **CJK support** — Chinese/Japanese/Korean text is segmented with jieba for accurate full-text search
-- **Memory CRUD** — store, search, update, delete memories with category/source/importance tags
-- **Conversation search** — search logged conversations by keyword, filterable by platform
-- **Knowledge bank** — drop `.md` files in `bank/`; they're auto-chunked, embedded, and searchable
-- **Daily logs** — append-only daily journal
-- **Message bus** — shared timeline across all sources
-- **Task queue** — submit tasks for Claude Code to execute asynchronously (supports multi-turn sessions)
-- **Context compression** — summarize old context lines with a local Ollama model, with truncation fallback
+| Capability | What it does |
+| --- | --- |
+| Memory CRUD | Store, update, delete, pin, tag, and link memories. |
+| Hybrid retrieval | Combines FTS5 keyword search, exact/LIKE matches, vector similarity, RRF fusion, and optional LLM reranking. |
+| Time-aware search | Parses explicit `after`/`before` filters and Chinese temporal expressions such as `昨天`, `上次`, `三周前`, `去年冬天` when `jionlp` is installed. |
+| Query expansion | Uses Cloudflare Workers AI when configured to add colloquial query variants before retrieval. |
+| Chunk-level conversation retrieval | Searches conversation summaries, then expands the best chunks with matching source messages. |
+| Graph neighbors | Surfaces linked memories and neighboring conversation chunks when they add useful context. |
+| Browser conversation sync | Receives claude.ai conversations from `imprint-chat-sync` through `POST /api/ingest`. |
+| Passive surfacing | A Claude Code `UserPromptSubmit` hook can inject compact `<recall>` blocks when a prompt looks memory-related. |
+| CJK-friendly FTS | Uses `jieba` when available, with character-level fallback, so Chinese/Japanese/Korean text remains searchable. |
+| Zero-provider fallback | If Ollama/API embeddings are unavailable, tools still work with FTS5 and exact matching. |
 
-All data in a single SQLite database (WAL mode).
+## Quick Start
 
-## Quick start
+### 1. I just want memory in Claude Code
 
 ```bash
-# Install
-pip install git+https://github.com/Qizhan7/imprint-memory.git
-
-# Register with Claude Code
+pip install imprint-memory
 claude mcp add -s user imprint-memory -- imprint-memory
 ```
 
-Or clone locally:
+Restart Claude Code. You should see the `imprint-memory` MCP tools. No API key is required. By default the server stores data in `~/.imprint/memory.db` and tries Ollama embeddings at `http://localhost:11434`; if Ollama is not running, search falls back to keyword-only.
+
+Optional local embeddings:
 
 ```bash
-git clone https://github.com/Qizhan7/imprint-memory.git
-cd imprint-memory && pip install -e .
+ollama pull bge-m3
+ollama serve
 ```
 
-## Tools
-
-| Tool | Description |
-|------|-------------|
-| `memory_remember` | Store a memory (category, source, importance) |
-| `memory_search` | **RRF unified search** across memories, bank, and conversations |
-| `memory_list` | List recent memories |
-| `memory_update` | Update a memory by ID |
-| `memory_delete` | Delete a memory by ID |
-| `memory_forget` | Delete memories matching a keyword |
-| `memory_pin` / `memory_unpin` | Pin/unpin core memories (pinned = no time-decay) |
-| `memory_add_tags` | Add tags to a memory (comma-separated) |
-| `memory_add_edge` | Link two memories with a typed relationship |
-| `memory_get_graph` | View a memory's tags, edges, and neighbor previews |
-| `memory_find_duplicates` | Find semantically similar pairs (dedup audit) |
-| `memory_find_stale` | Find low-activity old memories |
-| `memory_decay` | Reduce importance of inactive memories (dry-run by default) |
-| `memory_reindex` | Rebuild all embeddings (after switching providers) |
-| `memory_daily_log` | Append to today's log |
-| `conversation_search` | Search conversation history (all platforms) |
-| `search_telegram` | Search Telegram + heartbeat conversations |
-| `search_channel` | Search any specific channel (discord, slack, etc.) |
-| `message_bus_read` / `post` | Read/write the shared message bus |
-| `cc_execute` | Submit a task for Claude Code |
-| `cc_check` / `cc_tasks` | Check task status, list recent tasks |
-
-## Configuration
-
-All via environment variables:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `IMPRINT_DATA_DIR` | `~/.imprint/` | Base directory for all data |
-| `IMPRINT_DB` | `$IMPRINT_DATA_DIR/memory.db` | SQLite database path |
-| `TZ_OFFSET` | `0` | Hours offset from UTC (e.g. `12` for NZST) |
-| `EMBED_PROVIDER` | `ollama` | `ollama`, `openai`, or `google` |
-| `EMBED_MODEL` | auto | Model name (default: `bge-m3` / `text-embedding-3-small` / `gemini-embedding-2`) |
-| `OLLAMA_URL` | `http://localhost:11434` | Ollama endpoint |
-| `OPENAI_API_KEY` | — | For OpenAI-compatible providers |
-| `EMBED_API_BASE` | `https://api.openai.com` | Base URL for OpenAI-compatible API |
-| `GOOGLE_API_KEYS` | — | Comma-separated keys for Google Gemini Embedding (or `GOOGLE_API_KEY` for a single key) |
-
-### Embedding providers
-
-**Ollama (default)** — free, local:
-```bash
-ollama pull bge-m3 && ollama serve
-```
-
-**OpenAI API** — no local GPU:
-```bash
-export EMBED_PROVIDER=openai OPENAI_API_KEY=sk-...
-```
-
-**Any OpenAI-compatible API** (Voyage AI, Azure, etc.):
-```bash
-export EMBED_PROVIDER=openai OPENAI_API_KEY=... EMBED_API_BASE=https://... EMBED_MODEL=...
-```
-
-**Google Gemini Embedding** — supports text + image (multimodal):
-```bash
-export EMBED_PROVIDER=google GOOGLE_API_KEYS=key1,key2  # comma-separated for round-robin
-```
-
-No embedding provider? Falls back to FTS5 keyword search only — still works, just less semantic.
-
-After switching providers, run `memory_reindex` to rebuild embeddings.
-
-## HTTP mode
-
-For Claude.ai access through a tunnel:
+### 2. I also want to sync my claude.ai conversations
 
 ```bash
-pip install imprint-memory[http]
-imprint-memory --http   # → http://0.0.0.0:8000/mcp
+pip install 'imprint-memory[receiver]'
+imprint-memory-receiver
 ```
 
-OAuth credentials via `~/.imprint-oauth.json` or env vars (`OAUTH_CLIENT_ID`, `OAUTH_CLIENT_SECRET`, `OAUTH_ACCESS_TOKEN`).
-
-## Data layout
-
-```
-~/.imprint/
-├── memory.db           # SQLite (memories, vectors, tasks, bus)
-├── MEMORY.md           # Auto-generated index
-└── memory/
-    ├── 2026-04-01.md   # Daily logs
-    └── bank/           # Knowledge files (.md)
-```
-
-## Standalone vs Full Stack
-
-**This package works on its own** — `pip install` and you get persistent memory in Claude Code. No other dependencies.
-
-If you also want multi-channel messaging (Telegram, etc.), Claude.ai integration, heartbeat automation, a dashboard, and scheduled tasks, see the full system: [claude-imprint](https://github.com/Qizhan7/claude-imprint). It installs imprint-memory as a dependency.
-
-## Companion: claude.ai conversation sync
-
-The chat-sync pipeline lets you ingest conversations from anywhere (browser, scripts, other tools) into the same memory database:
-
-```
-imprint-chat-sync (browser ext)  ──POST──>  imprint-memory-receiver  ──>  memory.db
-                                             (auto embed + chunk + edges)
-```
-
-**1. Run the receiver** (needs `imprint-memory[http]`):
+The receiver listens on `127.0.0.1:8001`. Then install the companion extension:
 
 ```bash
-pip install 'imprint-memory[http]'
-imprint-memory-receiver              # listens on 127.0.0.1:8001
-# or:  PORT=9001 imprint-memory-receiver --no-backfill
+git clone https://github.com/Qizhan7/imprint-chat-sync.git
 ```
 
-Endpoints:
+Open Chrome → `chrome://extensions/` → enable Developer mode → Load unpacked → select the cloned `imprint-chat-sync` folder. Stay logged in to [claude.ai](https://claude.ai), then use the extension popup to sync.
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| `POST` | `/api/ingest` | Submit messages — `{ conversation_id, messages: [{ direction, content, ... }] }` |
-| `GET`  | `/api/health` | Liveness check |
-| `GET`  | `/api/status` | Recent count + embedded vector count |
+### 3. I want the full experience with the surfacing hook
 
-The receiver embeds new messages in the background and runs incremental chunking → topic summaries → graph edges, so search results stay rich.
-
-**2. Browser extension**: [imprint-chat-sync](https://github.com/Qizhan7/imprint-chat-sync) — pulls conversations (including `<thinking>` blocks) from claude.ai using your browser session and POSTs to this receiver.
-
-## Surfacing hook (recall as you type)
-
-`hooks/memory-check.sh` is a [UserPromptSubmit](https://docs.anthropic.com/en/docs/claude-code/hooks) hook that scans each message for recall-worthy signals (time references, emotion, "remember"...) and, if any are found, calls `surfacing_search()` to inject a `<recall>` block with the most relevant memory chunks plus one graph-linked neighbor. It always appends a `<memory-check>` reminder so the model knows to dig deeper when the turn touches the past.
-
-**Install:**
+Install the hook script:
 
 ```bash
-cp hooks/memory-check.sh ~/.claude/hooks/memory-check.sh
+mkdir -p ~/.claude/hooks
+HOOK_PATH="$(python - <<'PY'
+from importlib.resources import files
+print(files("imprint_memory") / "hooks" / "memory-check.sh")
+PY
+)"
+cp "$HOOK_PATH" ~/.claude/hooks/memory-check.sh
 chmod +x ~/.claude/hooks/memory-check.sh
 ```
 
-Add to `~/.claude/settings.json`:
+Add this to `~/.claude/settings.json`:
 
 ```json
 {
   "hooks": {
     "UserPromptSubmit": [
-      { "hooks": [{ "type": "command", "command": "bash $HOME/.claude/hooks/memory-check.sh" }] }
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/hooks/memory-check.sh"
+          }
+        ]
+      }
     ]
   }
 }
 ```
 
-**Hook environment variables:**
+For API keys used by the hook, copy `.env.example` to `~/.imprint/.env` and fill only what you use.
 
-| Variable | Purpose | Default |
-|----------|---------|---------|
-| `IMPRINT_PYTHON` | Python interpreter to use | `python3` |
-| `IMPRINT_DATA_DIR` | Where `memory.db` lives | `~/.imprint` |
-| `IMPRINT_ENV_FILE` | Path to a `KEY=VALUE` file (e.g. for `GOOGLE_API_KEY`, `CF_API_TOKEN`) | falls back to `~/.imprint/.env` if it exists |
-| `IMPRINT_HOOK_LANG` | Prompt language: `en` or `zh` | `en` |
+## Configuration
+
+All configuration is via environment variables. Defaults are chosen for local, private use.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `IMPRINT_DATA_DIR` | `~/.imprint` | Base directory for the database, daily logs, and bank files. |
+| `IMPRINT_DB` | `$IMPRINT_DATA_DIR/memory.db` | SQLite database path. |
+| `TZ_OFFSET` | `0` | Local timezone offset from UTC, in hours. |
+| `IMPRINT_USER_NAME` | `User` | Human speaker label used in summaries and chunk expansion. |
+| `IMPRINT_AGENT_NAME` | `Assistant` | Assistant speaker label used in summaries and chunk expansion. |
+| `IMPRINT_LOCALE` | `en` | Search output labels: `en` or `zh`. |
+| `EMBED_PROVIDER` | `ollama` | Embedding provider: `ollama`, `openai`, or `google`. |
+| `EMBED_MODEL` | provider default | Embedding model. Defaults: `bge-m3`, `text-embedding-3-small`, or `gemini-embedding-2`. |
+| `OLLAMA_URL` | `http://localhost:11434` | Ollama base URL for embeddings. |
+| `OPENAI_API_KEY` | unset | API key for OpenAI or OpenAI-compatible embedding providers. |
+| `EMBED_API_BASE` | `https://api.openai.com` | Base URL for OpenAI-compatible embedding APIs. |
+| `GOOGLE_API_KEY` | unset | Single Google Gemini API key. |
+| `GOOGLE_API_KEYS` | unset | Comma-separated Google keys for round-robin embedding calls. |
+| `CF_ACCOUNT_ID` | unset | Cloudflare account ID for query expansion, reranking, and summaries. |
+| `CF_API_TOKEN` | unset | Cloudflare API token. |
+| `CF_RERANK_MODEL` | `@cf/meta/llama-3.3-70b-instruct-fp8-fast` | Cloudflare model for query expansion and reranking. |
+| `CF_SUMMARY_MODEL` | `@cf/meta/llama-3.3-70b-instruct-fp8-fast` | Cloudflare model for chunk summaries. |
+| `GEMINI_SUMMARY_MODEL` | `gemini-2.5-flash-lite` | Gemini model used as a summary fallback. |
+| `OLLAMA_CHAT_URL` | `http://localhost:11434/api/chat` | Ollama chat endpoint for summary fallback. |
+| `OLLAMA_CHAT_MODEL` | `gemma4:e4b` | Ollama chat model for summaries and causal-edge prediction. |
+| `IMPRINT_HTTP_HOST` | `0.0.0.0` in HTTP mode | MCP HTTP bind host. |
+| `IMPRINT_HTTP_PORT` | `8000` | MCP HTTP port. |
+| `IMPRINT_OAUTH_FILE` | `~/.imprint-oauth.json` | OAuth credential file for HTTP mode. |
+| `OAUTH_CLIENT_ID` | unset | OAuth client ID fallback when no credential file exists. |
+| `OAUTH_CLIENT_SECRET` | unset | OAuth client secret fallback. |
+| `OAUTH_ACCESS_TOKEN` | unset | Bearer token used by HTTP mode. |
+| `IMPRINT_RECEIVER_HOST` | `127.0.0.1` | Chat-sync receiver bind host. Legacy `HOST` is also accepted. |
+| `IMPRINT_RECEIVER_PORT` | `8001` | Chat-sync receiver port. Legacy `PORT` is also accepted. |
+| `IMPRINT_RECEIVER_EMBED_DELAY` | `0.7` | Delay between background embedding calls, in seconds. |
+| `IMPRINT_RECEIVER_SHIFT_THRESHOLD` | `0.50` | Topic-shift cosine threshold for adjacent user messages. |
+| `IMPRINT_RECEIVER_CORS_ORIGIN_REGEX` | `^chrome-extension://.*$` | Allowed browser-extension origins. |
+| `IMPRINT_PYTHON` | auto-detect `python3.12`, `python3.11`, `python3.10`, then generic Python names | Python interpreter used by `hooks/memory-check.sh`. |
+| `IMPRINT_ENV_FILE` | unset | Extra `KEY=VALUE` file loaded by the hook before recall. |
+| `IMPRINT_HOOK_LANG` | `en` | Hook reminder language: `en` or `zh`. |
+| `STOPWORD_THRESHOLD` | `0.15` | Document-frequency threshold for auto-stopwords. |
+| `IMPRINT_STOPWORD_SKIP_PLATFORMS` | `cc` | Platforms ignored when building stopwords. |
+| `IMPRINT_CHUNK_SKIP_PLATFORMS` | `cc` | Platforms ignored by conversation chunking and chunk expansion. |
+| `IMPRINT_CAUSAL_BLACKLIST` | unset | Extra comma-separated terms ignored by causal-edge discovery. |
+| `MESSAGE_BUS_LIMIT` | `40` | Max messages retained in the shared message bus. |
+| `COMPRESS_MODEL` | `qwen3:8b` | Ollama model for `imprint_memory.compress`. |
+| `COMPRESS_KEEP` | `30` | Recent context lines kept uncompressed. |
+| `COMPRESS_THRESHOLD` | `50` | Line count that triggers compression. |
+
+## MCP Tool Reference
+
+| Tool | Description |
+| --- | --- |
+| `memory_remember` | Store a memory with category, source, importance, dedup, and embedding when available. |
+| `memory_search` | Search memories, bank files, conversations, chunks, and graph neighbors. |
+| `memory_list` | List recent active memories, optionally by category or time range. |
+| `memory_update` | Update content, category, or importance by memory ID. |
+| `memory_delete` | Delete one memory by ID. |
+| `memory_forget` | Delete memories containing a keyword. |
+| `memory_daily_log` | Append a timestamped entry to today’s daily log. |
+| `memory_pin` / `memory_unpin` | Mark core memories as exempt from search time decay, or restore normal decay. |
+| `memory_add_tags` | Add comma-separated tags to a memory. |
+| `memory_add_edge` | Link two memories with a typed relationship and short context. |
+| `memory_get_graph` | Show a memory’s tags, edges, and neighbor previews. |
+| `memory_find_duplicates` | Read-only semantic duplicate audit. |
+| `memory_find_stale` | Read-only stale-memory audit. |
+| `memory_decay` | Preview or apply importance decay for inactive memories. |
+| `memory_reindex` | Rebuild memory and bank embeddings after provider/model changes. |
+| `stopwords_build` | Rebuild auto-stopwords from document frequency. |
+| `stopwords_show` | Show current stopwords and metadata. |
+| `stopwords_add` / `stopwords_remove` | Manually add or suppress stopwords. |
+| `conversation_search` | Keyword search over conversation logs. |
+| `conversation_search_semantic` | Vector search over chunks first, then message vectors. |
+| `search_telegram` | Convenience search over `telegram` and `heartbeat` platforms. |
+| `search_channel` | Search any named conversation platform. |
+| `message_bus_read` / `message_bus_post` | Read or write the shared message timeline. |
+| `cc_execute` | Submit an asynchronous local Claude Code task. |
+| `cc_check` | Poll task status and retrieve result/session ID. |
+| `cc_tasks` | List recent Claude Code tasks. |
+| `experience_append` | Append a technical note to `memory/bank/experience.md`. |
+
+## Receiver API Reference
+
+Run:
+
+```bash
+imprint-memory-receiver --host 127.0.0.1 --port 8001
+```
+
+### `POST /api/ingest`
+
+Submit one conversation batch.
+
+```bash
+curl -X POST http://127.0.0.1:8001/api/ingest \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "platform": "claude.ai",
+    "conversation_id": "conv_123",
+    "conversation_title": "Planning session",
+    "model": "claude-opus-4-1",
+    "messages": [
+      {
+        "direction": "in",
+        "speaker": "User",
+        "content": "Remember that I prefer short PR summaries.",
+        "created_at": "2026-05-16 12:30:00",
+        "uuid": "msg_1"
+      },
+      {
+        "direction": "out",
+        "speaker": "Assistant",
+        "content": "Got it.",
+        "created_at": "2026-05-16 12:30:04",
+        "uuid": "msg_2"
+      }
+    ]
+  }'
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "ingested": 2,
+  "skipped": 0,
+  "errors": 0
+}
+```
+
+The receiver returns quickly, then embeds, detects topic shifts, summarizes chunks, and updates graph edges in background tasks.
+
+### `GET /api/health`
+
+```json
+{ "ok": true, "service": "imprint-chat-sync-receiver" }
+```
+
+### `GET /api/status`
+
+```json
+{
+  "ok": true,
+  "recent_count": 5,
+  "last_message": "2026-05-16 12:30:04",
+  "vectors": 42
+}
+```
+
+## How Search Works
+
+1. The query is optionally time-parsed (`昨天`, `上次`, `三周前`) and optionally expanded with Cloudflare Workers AI.
+2. The system embeds the expanded query when an embedding provider is available.
+3. Each pool searches independently: memories, bank chunks, raw conversation rows, summarized conversation chunks, and exact/LIKE matches.
+4. Ranked channels are fused with Reciprocal Rank Fusion.
+5. Pool-specific rerankers adjust for recency, importance, pinned memories, and file freshness.
+6. Optional Cloudflare reranking scores the top candidates for semantic relevance.
+7. Chunk hits expand to source messages; memory and chunk graph neighbors are appended when useful.
+8. Results update recall counters unless the search is an internal surfacing pass.
+
+## Data Layout
+
+```
+~/.imprint/
+├── memory.db
+├── MEMORY.md
+└── memory/
+    ├── 2026-05-16.md
+    └── bank/
+        └── experience.md
+```
+
+## Development
+
+```bash
+git clone https://github.com/Qizhan7/imprint-memory.git
+cd imprint-memory
+pip install -e '.[all]'
+python -c "from imprint_memory import server"
+```
+
+Run the stdio server:
+
+```bash
+imprint-memory
+```
+
+Run HTTP MCP mode:
+
+```bash
+imprint-memory --http --host 0.0.0.0 --port 8000
+```
 
 ## License
 

@@ -15,10 +15,10 @@ TZ_OFFSET = int(os.environ.get("TZ_OFFSET", 0))
 LOCAL_TZ = timezone(timedelta(hours=TZ_OFFSET))
 
 # Data directory: env var > ~/.imprint/
-DATA_DIR = Path(os.environ.get("IMPRINT_DATA_DIR", Path.home() / ".imprint"))
+DATA_DIR = Path(os.environ.get("IMPRINT_DATA_DIR", str(Path.home() / ".imprint"))).expanduser()
 
 # DB path: env var > DATA_DIR/memory.db
-DB_PATH = Path(os.environ.get("IMPRINT_DB", str(DATA_DIR / "memory.db")))
+DB_PATH = Path(os.environ.get("IMPRINT_DB", str(DATA_DIR / "memory.db"))).expanduser()
 
 # Daily logs and bank files
 DAILY_LOG_DIR = DATA_DIR / "memory"
@@ -147,8 +147,10 @@ def _init_tables(db: sqlite3.Connection):
             direction TEXT NOT NULL,
             speaker TEXT DEFAULT '',
             content TEXT NOT NULL,
+            external_id TEXT DEFAULT '',
             session_id TEXT DEFAULT '',
             entrypoint TEXT DEFAULT '',
+            model TEXT DEFAULT '',
             created_at TEXT NOT NULL
         );
 
@@ -210,7 +212,7 @@ def _init_tables(db: sqlite3.Connection):
             if "duplicate column name" not in str(e).lower():
                 raise
 
-    # Migration: add summary column to conversation_log
+    # Migration: add optional metadata columns to conversation_log
     convlog_cols = {
         row["name"] if isinstance(row, sqlite3.Row) else row[1]
         for row in db.execute("PRAGMA table_info(conversation_log)").fetchall()
@@ -221,6 +223,24 @@ def _init_tables(db: sqlite3.Connection):
         except sqlite3.OperationalError as e:
             if "duplicate column name" not in str(e).lower():
                 raise
+    if "model" not in convlog_cols:
+        try:
+            db.execute("ALTER TABLE conversation_log ADD COLUMN model TEXT DEFAULT ''")
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
+    if "external_id" not in convlog_cols:
+        try:
+            db.execute("ALTER TABLE conversation_log ADD COLUMN external_id TEXT DEFAULT ''")
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
+
+    db.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_conversation_log_external_id
+        ON conversation_log(platform, external_id)
+        WHERE external_id IS NOT NULL AND external_id != ''
+    """)
 
     # Migration: add session_id column to cc_tasks
     cctask_cols = {
@@ -312,10 +332,12 @@ def _init_tables(db: sqlite3.Connection):
 # --- Time Utils -------------------------------------------------------
 
 def now_local() -> datetime:
+    """Return the current time using the configured local timezone."""
     return datetime.now(LOCAL_TZ)
 
 
 def now_str() -> str:
+    """Return a SQLite-friendly local timestamp."""
     return now_local().strftime("%Y-%m-%d %H:%M:%S")
 
 

@@ -38,6 +38,7 @@ LOCAL_TZ = timezone(timedelta(hours=TZ_OFFSET))
 
 
 def now_str() -> str:
+    """Return current local clock time for console log prefixes."""
     return datetime.now(LOCAL_TZ).strftime("%H:%M:%S")
 
 
@@ -96,10 +97,11 @@ def check_db() -> dict:
 
 def check_http_server() -> tuple[bool, int | None]:
     """Check if the MCP HTTP server is responding."""
+    port = int(os.environ.get("IMPRINT_HTTP_PORT", "8000"))
     try:
         import urllib.request
-        resp = urllib.request.urlopen("http://localhost:8000/mcp", timeout=2)
-        return True, 8000
+        resp = urllib.request.urlopen(f"http://localhost:{port}/mcp", timeout=2)
+        return True, port
     except Exception:
         return False, None
 
@@ -219,6 +221,7 @@ def tail_log(log_path: Path):
 
 
 def main():
+    """CLI entry point for the console status and log viewer."""
     signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
 
     if "--status" in sys.argv:

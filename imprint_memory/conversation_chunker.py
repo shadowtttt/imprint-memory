@@ -11,8 +11,6 @@ import struct
 import urllib.request
 from datetime import datetime
 
-import numpy as np
-
 from .db import _get_db, segment_cjk
 from .memory_manager import _embed, _blob_to_vec, _cosine_similarity
 
@@ -23,20 +21,24 @@ SIM_THRESHOLD = 0.55   # adjacent message similarity below this → topic shift
 GAP_MINUTES = 120      # 2h silence gap → force chunk boundary
 MAX_MSGS_PER_CHUNK = 50
 MIN_MSGS_PER_CHUNK = 3
-SKIP_PLATFORMS = {"cc"}
+SKIP_PLATFORMS = {
+    p.strip()
+    for p in os.environ.get("IMPRINT_CHUNK_SKIP_PLATFORMS", "cc").split(",")
+    if p.strip()
+}
 
 # Speaker names (configurable per deployment)
 USER_NAME = os.environ.get("IMPRINT_USER_NAME", "User")
 AGENT_NAME = os.environ.get("IMPRINT_AGENT_NAME", "Assistant")
 
 # Ollama config (fallback)
-OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
-OLLAMA_MODEL = "gemma4:e4b"
+OLLAMA_CHAT_URL = os.environ.get("OLLAMA_CHAT_URL", "http://localhost:11434/api/chat")
+OLLAMA_MODEL = os.environ.get("OLLAMA_CHAT_MODEL", "gemma4:e4b")
 
 # Cloudflare Workers AI config (primary)
 CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID", "")
 CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "")
-CF_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+CF_MODEL = os.environ.get("CF_SUMMARY_MODEL", "@cf/meta/llama-3.3-70b-instruct-fp8-fast")
 
 SUMMARIZE_PROMPT = f"""你在帮一个人整理记忆。读完这段对话后，用"跟朋友讲那天的事"的方式复述，并提取关键记忆片段。
 
@@ -58,12 +60,14 @@ SUMMARIZE_PROMPT = f"""你在帮一个人整理记忆。读完这段对话后，
 
 
 def _strip_thinking(content: str, direction: str) -> str:
+    """Remove hidden thinking blocks from assistant messages before summarizing."""
     if direction == "out":
         return THINK_RE.sub("", content).strip()
     return content
 
 
 def _format_chunk_messages(messages: list[dict]) -> str:
+    """Format raw conversation rows into a speaker-labeled transcript."""
     lines = []
     for m in messages:
         speaker = m.get("speaker") or (USER_NAME if m["direction"] == "in" else AGENT_NAME)
@@ -79,6 +83,7 @@ GEMINI_MODEL = os.environ.get("GEMINI_SUMMARY_MODEL", "gemini-2.5-flash-lite")
 
 
 def _call_gemini(prompt: str) -> str | None:
+    """Call Gemini for chunk summaries when a Google API key is configured."""
     keys = [k.strip() for k in os.environ.get("GOOGLE_API_KEYS", "").split(",") if k.strip()]
     if not keys:
         key = os.environ.get("GOOGLE_API_KEY", "")
@@ -103,6 +108,7 @@ def _call_gemini(prompt: str) -> str | None:
 
 
 def _call_cloudflare(prompt: str) -> str | None:
+    """Call Cloudflare Workers AI for chunk summaries when credentials exist."""
     if not CF_ACCOUNT_ID or not CF_API_TOKEN:
         return None
     url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{CF_MODEL}"
@@ -134,6 +140,7 @@ def _call_cloudflare(prompt: str) -> str | None:
 
 
 def _call_ollama(prompt: str) -> str | None:
+    """Call a local Ollama chat model for chunk summaries."""
     payload = json.dumps({
         "model": OLLAMA_MODEL,
         "messages": [{"role": "user", "content": prompt}],
@@ -214,6 +221,23 @@ def _parse_legacy_output(raw: str) -> dict:
 TOP_K_NEIGHBORS = 8
 
 
+def _load_numpy():
+    """Import numpy only for graph-building paths that need matrix math."""
+    try:
+        import numpy as np
+        return np
+    except ImportError:
+        return None
+
+
+def _platform_exclusion(column: str) -> tuple[str, list[str]]:
+    """Build a parameterized platform exclusion clause."""
+    if not SKIP_PLATFORMS:
+        return "", []
+    placeholders = ",".join("?" for _ in SKIP_PLATFORMS)
+    return f"AND {column} NOT IN ({placeholders})", list(SKIP_PLATFORMS)
+
+
 def _ensure_table(db):
     db.execute("""
         CREATE TABLE IF NOT EXISTS conversation_chunks (
@@ -292,16 +316,16 @@ def _get_last_chunked_msg_id(db) -> int:
 
 
 def _fetch_unchunked_messages(db, after_id: int, limit: int = 2000) -> list[dict]:
-    placeholders = ",".join(f"'{p}'" for p in SKIP_PLATFORMS)
+    platform_sql, platform_params = _platform_exclusion("c.platform")
     rows = db.execute(
         f"""SELECT c.id, c.platform, c.direction, c.speaker, c.content,
                    c.session_id, c.created_at, v.embedding
             FROM conversation_log c
             LEFT JOIN conversation_vectors v ON c.id = v.msg_id
-            WHERE c.id > ? AND c.platform NOT IN ({placeholders})
+            WHERE c.id > ? {platform_sql}
             ORDER BY c.id
             LIMIT ?""",
-        (after_id, limit),
+        (after_id, *platform_params, limit),
     ).fetchall()
     return [dict(r) for r in rows]
 
@@ -360,6 +384,7 @@ def _split_into_chunks(messages: list[dict]) -> list[list[dict]]:
 
 
 def chunk_and_summarize(batch_size: int = 200, dry_run: bool = False) -> dict:
+    """Chunk unprocessed conversation messages and summarize each chunk."""
     db = _get_db()
     try:
         _ensure_table(db)
@@ -477,12 +502,13 @@ def search_chunks(query: str, limit: int = 10) -> list[dict]:
 
         # Expand original messages, filtering out cc platform
         for chunk in top:
+            platform_sql, platform_params = _platform_exclusion("platform")
             msgs = db.execute(
-                """SELECT id, platform, direction, speaker, content, created_at
+                f"""SELECT id, platform, direction, speaker, content, created_at
                    FROM conversation_log
-                   WHERE id BETWEEN ? AND ? AND platform NOT IN ('cc')
+                   WHERE id BETWEEN ? AND ? {platform_sql}
                    ORDER BY id""",
-                (chunk["start_msg_id"], chunk["end_msg_id"]),
+                (chunk["start_msg_id"], chunk["end_msg_id"], *platform_params),
             ).fetchall()
             chunk["messages"] = [dict(m) for m in msgs]
             for m in chunk["messages"]:
@@ -494,6 +520,7 @@ def search_chunks(query: str, limit: int = 10) -> list[dict]:
 
 
 def format_chunk_results(results: list[dict]) -> str:
+    """Format chunk search results with summaries and expanded messages."""
     if not results:
         return "没有找到相关对话记录"
 
@@ -553,6 +580,10 @@ def build_causal_edges(time_min_days: int = 1, time_max_days: int = 365,
     3. For each candidate, predict continuation of A, embed it, compare with B
     4. If continuation_similarity > threshold → causal edge A→B
     """
+    np = _load_numpy()
+    if np is None:
+        return {"ok": False, "error": "numpy is required for causal edge building; install imprint-memory[vectors]"}
+
     db = _get_db()
     try:
         _ensure_table(db)
@@ -700,6 +731,10 @@ def _ensure_edge_table(db):
 def build_chunk_edges(k: int = TOP_K_NEIGHBORS) -> dict:
     """Build top-K edges between all chunks based on embedding similarity.
     Uses numpy matrix multiplication for O(n²) speedup over pure Python."""
+    np = _load_numpy()
+    if np is None:
+        return {"ok": False, "error": "numpy is required for chunk edge building; install imprint-memory[vectors]"}
+
     db = _get_db()
     try:
         _ensure_table(db)
@@ -757,6 +792,9 @@ def update_edges_for_new_chunks(new_chunk_ids: list[int], k: int = TOP_K_NEIGHBO
     Much faster than full rebuild — O(new × total) instead of O(total²)."""
     if not new_chunk_ids:
         return {"ok": True, "edges": 0}
+    np = _load_numpy()
+    if np is None:
+        return {"ok": False, "error": "numpy is required for chunk edge building; install imprint-memory[vectors]"}
 
     db = _get_db()
     try:
@@ -948,12 +986,13 @@ def search_chunks_with_graph(query: str, limit: int = 5, expand: int = 2) -> lis
 
         # Expand original messages for all results
         for chunk in all_results:
+            platform_sql, platform_params = _platform_exclusion("platform")
             msgs = db.execute(
-                """SELECT id, platform, direction, speaker, content, created_at
+                f"""SELECT id, platform, direction, speaker, content, created_at
                    FROM conversation_log
-                   WHERE id BETWEEN ? AND ? AND platform NOT IN ('cc')
+                   WHERE id BETWEEN ? AND ? {platform_sql}
                    ORDER BY id""",
-                (chunk["start_msg_id"], chunk["end_msg_id"]),
+                (chunk["start_msg_id"], chunk["end_msg_id"], *platform_params),
             ).fetchall()
             chunk["messages"] = [dict(m) for m in msgs]
             for m in chunk["messages"]:
@@ -965,6 +1004,7 @@ def search_chunks_with_graph(query: str, limit: int = 5, expand: int = 2) -> lis
 
 
 def format_graph_results(results: list[dict]) -> str:
+    """Format graph-expanded chunk search results."""
     if not results:
         return "没有找到相关对话记录"
 

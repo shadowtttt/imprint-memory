@@ -28,7 +28,7 @@ USER_NAME = os.environ.get("IMPRINT_USER_NAME", "User")
 AGENT_NAME = os.environ.get("IMPRINT_AGENT_NAME", "Assistant")
 
 # ─── Embedding Config ────────────────────────────────────
-EMBED_PROVIDER = os.environ.get("EMBED_PROVIDER", "google")  # "google", "ollama", or "openai"
+EMBED_PROVIDER = os.environ.get("EMBED_PROVIDER", "ollama").lower()  # "ollama", "openai", or "google"
 
 # Ollama settings
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
@@ -65,7 +65,11 @@ WEIGHT_RECENCY = 0.2
 
 # Stopwords config
 STOPWORD_THRESHOLD = float(os.environ.get("STOPWORD_THRESHOLD", "0.15"))
-STOPWORD_SKIP_PLATFORMS = {"cc"}
+STOPWORD_SKIP_PLATFORMS = {
+    p.strip()
+    for p in os.environ.get("IMPRINT_STOPWORD_SKIP_PLATFORMS", "cc").split(",")
+    if p.strip()
+}
 _stopword_cache: set[str] | None = None
 _stopword_cache_ts: float = 0
 
@@ -84,21 +88,28 @@ def build_stopwords(threshold: float | None = None) -> dict:
         from collections import Counter
         doc_freq: dict[str, Counter] = {}
 
+        if STOPWORD_SKIP_PLATFORMS:
+            skip_list = ",".join("?" for _ in STOPWORD_SKIP_PLATFORMS)
+            conversation_sql = (
+                "SELECT content FROM conversation_log "
+                f"WHERE platform NOT IN ({skip_list}) AND content IS NOT NULL"
+            )
+            conversation_params = list(STOPWORD_SKIP_PLATFORMS)
+        else:
+            conversation_sql = "SELECT content FROM conversation_log WHERE content IS NOT NULL"
+            conversation_params = []
+
         pools = [
-            ("conversation_log",
-             "SELECT content FROM conversation_log WHERE platform NOT IN ({}) AND content IS NOT NULL".format(
-                 ",".join(f"'{p}'" for p in STOPWORD_SKIP_PLATFORMS))),
-            ("memories",
-             "SELECT content FROM memories WHERE content IS NOT NULL"),
-            ("chunks",
-             "SELECT summary AS content FROM conversation_chunks WHERE summary IS NOT NULL"),
+            ("conversation_log", conversation_sql, conversation_params),
+            ("memories", "SELECT content FROM memories WHERE content IS NOT NULL", []),
+            ("chunks", "SELECT summary AS content FROM conversation_chunks WHERE summary IS NOT NULL", []),
         ]
 
         pool_totals: dict[str, int] = {}
         word_pool_counts: Counter = Counter()
 
-        for pool_name, sql in pools:
-            rows = db.execute(sql).fetchall()
+        for pool_name, sql, params in pools:
+            rows = db.execute(sql, params).fetchall()
             pool_totals[pool_name] = len(rows)
             for r in rows:
                 content = r["content"] or ""
@@ -324,14 +335,27 @@ def _embed_google(text: str, image_path: Optional[str] = None) -> Optional[list[
 
 
 def _embed(text: str, image_path: Optional[str] = None) -> Optional[list[float]]:
-    """Generate embedding vector using configured provider.
-    Returns None on failure (search falls back to FTS5 keyword only).
-    image_path is only supported with the 'google' provider."""
-    if EMBED_PROVIDER == "google":
-        return _embed_google(text, image_path=image_path)
-    if EMBED_PROVIDER == "openai":
-        return _embed_openai(text)
-    return _embed_ollama(text)
+    """Generate an embedding vector, falling back to Ollama and then keyword-only search.
+
+    Returns None when every provider is unavailable; callers keep working via
+    FTS5/LIKE retrieval. image_path is only supported by the Google provider.
+    """
+    providers = [EMBED_PROVIDER]
+    if EMBED_PROVIDER != "ollama":
+        providers.append("ollama")
+
+    for provider in providers:
+        if provider == "google":
+            vec = _embed_google(text, image_path=image_path)
+        elif provider == "openai":
+            vec = _embed_openai(text)
+        elif provider == "ollama":
+            vec = _embed_ollama(text)
+        else:
+            vec = None
+        if vec:
+            return vec
+    return None
 
 
 def _vec_to_blob(vec: list[float]) -> bytes:
@@ -364,9 +388,17 @@ def _recency_score(created_at: str) -> float:
         return 0.5
 
 
-def datetime_strptime(s: str):
-    from datetime import datetime
-    return datetime.strptime(s, "%Y-%m-%d %H:%M").replace(tzinfo=LOCAL_TZ)
+def datetime_strptime(s: str) -> datetime:
+    """Parse imprint timestamps with or without seconds."""
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(s[:len("2026-01-01 00:00:00")], fmt).replace(tzinfo=LOCAL_TZ)
+        except ValueError:
+            continue
+    parsed = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=LOCAL_TZ)
+    return parsed.astimezone(LOCAL_TZ)
 
 
 # ─── Core API ────────────────────────────────────────────
@@ -1359,7 +1391,7 @@ def _search_fact_channels(query_vec, db, limit=30):
 
 _CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID", "")
 _CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "")
-_CF_RERANK_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+_CF_RERANK_MODEL = os.environ.get("CF_RERANK_MODEL", "@cf/meta/llama-3.3-70b-instruct-fp8-fast")
 
 _RERANK_PROMPT = """给每条候选结果打相关性分（0-10），只输出JSON数组。
 
@@ -1922,7 +1954,7 @@ def unified_search(
         pool, score, rrf_raw, id, content, + pool-specific fields
     """
     if pools is None:
-        pools = ["memory", "conversation"]
+        pools = ["memory", "bank", "conversation"]
 
     if (after or before) and "bank" in pools:
         pools = [p for p in pools if p != "bank"]
@@ -2079,7 +2111,7 @@ def unified_search(
     if after or before:
         _TIME_BOOST = 0.5
         for r in results:
-            ts = r.get("created_at", "")
+            ts = r.get("created_at") or r.get("start_time", "")
             if not ts:
                 continue
             in_range = True
@@ -2534,5 +2566,3 @@ def get_edges(memory_id: int) -> list[dict]:
         })
     db.close()
     return edges
-
-

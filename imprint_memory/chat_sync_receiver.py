@@ -24,7 +24,6 @@ The receiver shares the same SQLite database as the main imprint-memory server
 import math
 import os
 import re
-import sqlite3
 import struct
 import threading
 import time
@@ -36,19 +35,27 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from .conversation import log_message, get_recent
-from .db import DB_PATH
+from .db import _get_db as _get_app_db
 
 DEFAULT_PORT = 8001
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 EMBED_DELAY = float(os.environ.get("IMPRINT_RECEIVER_EMBED_DELAY", "0.7"))
 SHIFT_THRESHOLD = float(os.environ.get("IMPRINT_RECEIVER_SHIFT_THRESHOLD", "0.50"))
+RECEIVER_HOST_ENV = os.environ.get("IMPRINT_RECEIVER_HOST", os.environ.get("HOST", "127.0.0.1"))
+RECEIVER_PORT_ENV = int(os.environ.get("IMPRINT_RECEIVER_PORT", os.environ.get("PORT", DEFAULT_PORT)))
+RECEIVER_CORS_ORIGIN_REGEX = os.environ.get(
+    "IMPRINT_RECEIVER_CORS_ORIGIN_REGEX",
+    r"^chrome-extension://.*$",
+)
 
 
 def _blob_to_vec(blob):
+    """Decode a float32 embedding blob."""
     return list(struct.unpack(f"{len(blob)//4}f", blob))
 
 
 def _cosine_sim(a, b):
+    """Return cosine similarity for same-length vectors."""
     if len(a) != len(b):
         return 0.0
     dot = sum(x * y for x, y in zip(a, b))
@@ -58,8 +65,8 @@ def _cosine_sim(a, b):
 
 
 def _get_db():
-    db = sqlite3.connect(str(DB_PATH))
-    db.row_factory = sqlite3.Row
+    """Open the receiver database connection and ensure receiver-owned tables."""
+    db = _get_app_db()
     db.execute("""CREATE TABLE IF NOT EXISTS conversation_vectors (
         msg_id INTEGER PRIMARY KEY,
         embedding BLOB NOT NULL,
@@ -86,7 +93,7 @@ def embed_new_messages(msg_ids):
     if not msg_ids:
         return
     try:
-        from .memory_manager import _embed
+        from .memory_manager import EMBED_MODEL, _embed
     except Exception:
         return
 
@@ -116,7 +123,7 @@ def embed_new_messages(msg_ids):
                 if vec:
                     db.execute(
                         "INSERT OR IGNORE INTO conversation_vectors (msg_id, embedding, model) VALUES (?, ?, ?)",
-                        (msg_id, struct.pack(f"{len(vec)}f", *vec), "gemini-embedding-2"),
+                        (msg_id, struct.pack(f"{len(vec)}f", *vec), EMBED_MODEL),
                     )
                     db.commit()
             except Exception:
@@ -194,6 +201,7 @@ def detect_topic_shifts(db, msg_ids):
 
 
 async def ingest(request):
+    """Ingest a batch of conversation messages from the browser extension."""
     try:
         data = await request.json()
     except Exception:
@@ -224,6 +232,7 @@ async def ingest(request):
             created_at=msg.get("created_at", ""),
             summary=msg.get("summary", ""),
             model=msg.get("model", data.get("model", "")),
+            external_id=msg.get("external_id") or msg.get("uuid", ""),
         )
 
         if result.get("skipped"):
@@ -242,10 +251,12 @@ async def ingest(request):
 
 
 async def health(request):
+    """Return a lightweight liveness response."""
     return JSONResponse({"ok": True, "service": "imprint-chat-sync-receiver"})
 
 
 async def status(request):
+    """Return recent ingest and embedding status for the extension popup."""
     recent = get_recent(platform="claude.ai", limit=5)
     db = _get_db()
     try:
@@ -270,7 +281,7 @@ app = Starlette(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"^chrome-extension://.*$",
+    allow_origin_regex=RECEIVER_CORS_ORIGIN_REGEX,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Content-Type"],
 )
@@ -335,18 +346,19 @@ def _backfill_on_startup():
 
 
 def main():
+    """Run the chat-sync receiver HTTP service."""
     import argparse
 
     parser = argparse.ArgumentParser(description="Imprint chat sync receiver")
     parser.add_argument(
         "--host",
-        default=os.environ.get("HOST", "127.0.0.1"),
+        default=RECEIVER_HOST_ENV,
         help="Bind address (default: 127.0.0.1)",
     )
     parser.add_argument(
         "--port",
         type=int,
-        default=int(os.environ.get("PORT", DEFAULT_PORT)),
+        default=RECEIVER_PORT_ENV,
         help=f"Port (default: {DEFAULT_PORT})",
     )
     parser.add_argument(

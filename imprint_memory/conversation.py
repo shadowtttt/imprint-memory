@@ -17,29 +17,57 @@ def log_message(
     created_at: str = "",
     summary: str = "",
     model: str = "",
+    external_id: str = "",
 ) -> dict:
-    """Write one message to conversation_log."""
+    """Write one message to conversation_log.
+
+    external_id is a stable upstream message id used for dedup when available.
+    Older clients can omit it and fall back to content/timestamp dedup.
+    """
     if not content or not content.strip():
         return {"ok": False, "error": "empty content"}
 
     ts = created_at or now_str()
+    clean_content = content.strip()
+    external_id = (external_id or "").strip()
     db = _get_db()
     try:
-        # Dedup: skip if exact same entry already exists
-        existing = db.execute(
-            """SELECT 1 FROM conversation_log
-               WHERE platform=? AND direction=? AND created_at=? AND content=?
-               LIMIT 1""",
-            (platform, direction, ts, content.strip()),
-        ).fetchone()
+        # Browser/API sources should provide a stable message id. Treat it as
+        # authoritative so branch re-syncs and repeated text stay distinct.
+        if external_id:
+            existing = db.execute(
+                """SELECT id FROM conversation_log
+                   WHERE platform=? AND external_id=?
+                   LIMIT 1""",
+                (platform, external_id),
+            ).fetchone()
+        else:
+            # Fallback for older clients that predate external message ids.
+            existing = db.execute(
+                """SELECT id FROM conversation_log
+                   WHERE platform=? AND direction=? AND created_at=? AND content=?
+                   LIMIT 1""",
+                (platform, direction, ts, clean_content),
+            ).fetchone()
         if existing:
-            return {"ok": True, "id": None, "skipped": "duplicate"}
+            return {"ok": True, "id": existing["id"], "skipped": "duplicate"}
 
         cur = db.execute(
             """INSERT INTO conversation_log
-               (platform, direction, speaker, content, session_id, entrypoint, created_at, summary, model)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (platform, direction, speaker, content.strip(), session_id, entrypoint, ts, summary, model),
+               (platform, direction, speaker, content, external_id, session_id, entrypoint, created_at, summary, model)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                platform,
+                direction,
+                speaker,
+                clean_content,
+                external_id,
+                session_id,
+                entrypoint,
+                ts,
+                summary,
+                model,
+            ),
         )
         db.commit()
         return {"ok": True, "id": cur.lastrowid}

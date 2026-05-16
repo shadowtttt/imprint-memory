@@ -30,6 +30,18 @@ chinese = [
     "jionlp>=1.5.0",
     "jieba>=0.42.0",
 ]
+receiver = [
+    "uvicorn>=0.34.0",
+    "starlette>=0.27.0",
+    "numpy>=1.24.0",
+]
+all = [
+    "uvicorn>=0.34.0",
+    "starlette>=0.27.0",
+    "numpy>=1.24.0",
+    "jionlp>=1.5.0",
+    "jieba>=0.42.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/Qizhan7/imprint-memory"
@@ -47,3 +59,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["imprint_memory"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"hooks/memory-check.sh" = "imprint_memory/hooks/memory-check.sh"

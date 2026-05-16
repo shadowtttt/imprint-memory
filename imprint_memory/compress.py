@@ -116,6 +116,7 @@ def compress_file(context_file: Path, keep: int = 0, threshold: int = 0) -> bool
 
 
 def main():
+    """CLI entry point for context-file compression."""
     if len(sys.argv) < 2:
         print("Usage: python3 -m imprint_memory.compress <context_file>", file=sys.stderr)
         sys.exit(1)
