@@ -1,5 +1,7 @@
 # imprint-memory
 
+[中文文档](README_zh.md)
+
 Local long-term memory for Claude Code users who want searchable, private recall across notes, conversations, and Claude.ai history.
 
 ```
@@ -277,7 +279,9 @@ The receiver returns quickly, then embeds, detects topic shifts, summarizes chun
 git clone https://github.com/Qizhan7/imprint-memory.git
 cd imprint-memory
 pip install -e '.[all]'
+pip install pytest
 python -c "from imprint_memory import server"
+pytest
 ```
 
 Run the stdio server:

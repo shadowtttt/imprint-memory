@@ -372,7 +372,7 @@ def main():
         import uvicorn
     except ImportError:
         print(
-            "uvicorn is required. Install with: pip install 'imprint-memory[http]'",
+            "uvicorn is required. Install with: pip install 'imprint-memory[receiver]'",
             flush=True,
         )
         raise SystemExit(1)

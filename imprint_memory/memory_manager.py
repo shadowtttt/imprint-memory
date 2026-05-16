@@ -99,11 +99,16 @@ def build_stopwords(threshold: float | None = None) -> dict:
             conversation_sql = "SELECT content FROM conversation_log WHERE content IS NOT NULL"
             conversation_params = []
 
+        existing_tables = {r[0] for r in db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+
         pools = [
             ("conversation_log", conversation_sql, conversation_params),
             ("memories", "SELECT content FROM memories WHERE content IS NOT NULL", []),
-            ("chunks", "SELECT summary AS content FROM conversation_chunks WHERE summary IS NOT NULL", []),
         ]
+        if "conversation_chunks" in existing_tables:
+            pools.append(("chunks", "SELECT summary AS content FROM conversation_chunks WHERE summary IS NOT NULL", []))
 
         pool_totals: dict[str, int] = {}
         word_pool_counts: Counter = Counter()
@@ -2321,6 +2326,9 @@ def surfacing_search(query: str, limit: int = 3) -> str:
         return ""
 
     lines = []
+    locale = os.environ.get("IMPRINT_LOCALE", "en")
+    mem_label = "记忆" if locale == "zh" else "Memory"
+    conv_label = "对话" if locale == "zh" else "Chat"
 
     for r in results:
         if r.get("score", 0) <= 0 or r.get("source") == "edge":
@@ -2329,7 +2337,7 @@ def surfacing_search(query: str, limit: int = 3) -> str:
         if r["pool"] == "memory":
             content = r.get("content", "")[:60]
             ts = (r.get("created_at", "") or "")[:10]
-            lines.append(f"[记忆|{ts}] {content}")
+            lines.append(f"[{mem_label}|{ts}] {content}")
 
         elif r["pool"] == "chunk":
             summary = r.get("summary", r.get("content", ""))[:60]
@@ -2342,7 +2350,7 @@ def surfacing_search(query: str, limit: int = 3) -> str:
         elif r["pool"] == "conversation":
             content = r.get("content", "")[:60]
             sp = r.get("speaker") or (USER_NAME if r.get("direction") == "in" else AGENT_NAME)
-            lines.append(f"[对话] {sp}: {content}")
+            lines.append(f"[{conv_label}] {sp}: {content}")
 
     if not lines:
         return ""

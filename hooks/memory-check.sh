@@ -67,6 +67,7 @@ done
 INPUT=$(cat)
 
 if [ -z "$PYTHON_BIN" ]; then
+    echo "[imprint] No suitable Python (>=3.10) found. Set IMPRINT_PYTHON or install Python 3.10+. Surfacing disabled." >&2
     USER_MSG=""
     SHOULD_SURFACE=""
 else
