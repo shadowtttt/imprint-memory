@@ -34,6 +34,14 @@ UserPromptSubmit hook ── surfacing_search ── <recall> ──┘
 
 ## 快速开始
 
+### 一键安装（推荐）
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Qizhan7/imprint-memory/main/scripts/setup.sh | bash
+```
+
+自动安装 imprint-memory + Ollama + bge-m3 嵌入模型 + 注册 Claude Code MCP，一行搞定。
+
 ### 1. 基础安装 — Claude Code 里用记忆
 
 ```bash

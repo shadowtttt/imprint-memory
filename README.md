@@ -36,6 +36,14 @@ UserPromptSubmit hook ── surfacing_search ── <recall> ──┘
 
 ## Quick Start
 
+### One-line setup (recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Qizhan7/imprint-memory/main/scripts/setup.sh | bash
+```
+
+This installs imprint-memory, Ollama, the bge-m3 embedding model, and registers the MCP server in Claude Code — all in one go.
+
 ### 1. I just want memory in Claude Code
 
 ```bash
