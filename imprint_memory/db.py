@@ -172,6 +172,14 @@ def _init_tables(db: sqlite3.Connection):
         );
         CREATE INDEX IF NOT EXISTS idx_edges_source ON memory_edges(source_id);
         CREATE INDEX IF NOT EXISTS idx_edges_target ON memory_edges(target_id);
+
+        CREATE TABLE IF NOT EXISTS stopwords (
+            word TEXT PRIMARY KEY,
+            doc_freq REAL DEFAULT 0,
+            source TEXT DEFAULT 'auto',
+            active INTEGER DEFAULT 1,
+            updated_at TEXT
+        );
     """)
 
     # Migration: add superseded_by column if missing

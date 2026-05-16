@@ -16,6 +16,7 @@ def log_message(
     entrypoint: str = "",
     created_at: str = "",
     summary: str = "",
+    model: str = "",
 ) -> dict:
     """Write one message to conversation_log."""
     if not content or not content.strip():
@@ -24,11 +25,21 @@ def log_message(
     ts = created_at or now_str()
     db = _get_db()
     try:
+        # Dedup: skip if exact same entry already exists
+        existing = db.execute(
+            """SELECT 1 FROM conversation_log
+               WHERE platform=? AND direction=? AND created_at=? AND content=?
+               LIMIT 1""",
+            (platform, direction, ts, content.strip()),
+        ).fetchone()
+        if existing:
+            return {"ok": True, "id": None, "skipped": "duplicate"}
+
         cur = db.execute(
             """INSERT INTO conversation_log
-               (platform, direction, speaker, content, session_id, entrypoint, created_at, summary)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (platform, direction, speaker, content.strip(), session_id, entrypoint, ts, summary),
+               (platform, direction, speaker, content, session_id, entrypoint, created_at, summary, model)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (platform, direction, speaker, content.strip(), session_id, entrypoint, ts, summary, model),
         )
         db.commit()
         return {"ok": True, "id": cur.lastrowid}
@@ -129,7 +140,7 @@ def get_recent(platform: str = "", exclude_platforms: list = None, limit: int = 
 
 def format_recent(messages: list[dict], max_content_len: int = 300) -> str:
     """Format recent messages for recent_context.md.
-    Collapses multiline content to single line and truncates if needed."""
+    Uses pre-computed summary if available; falls back to truncation."""
     platform_short = {"telegram": "tg", "wechat": "wx", "cc": "cc", "heartbeat": "hb"}
     lines = []
     for m in messages:

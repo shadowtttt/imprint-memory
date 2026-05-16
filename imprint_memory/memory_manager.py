@@ -11,7 +11,6 @@ import os
 import re
 import sqlite3
 import struct
-import sys
 import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -24,8 +23,12 @@ from .db import (
     _CJK_RE, _JIEBA_OK,
 )
 
+# ─── Speaker Config ──────────────────────────────────────
+USER_NAME = os.environ.get("IMPRINT_USER_NAME", "User")
+AGENT_NAME = os.environ.get("IMPRINT_AGENT_NAME", "Assistant")
+
 # ─── Embedding Config ────────────────────────────────────
-EMBED_PROVIDER = os.environ.get("EMBED_PROVIDER", "ollama")  # "ollama", "google", or "openai"
+EMBED_PROVIDER = os.environ.get("EMBED_PROVIDER", "google")  # "google", "ollama", or "openai"
 
 # Ollama settings
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
@@ -60,22 +63,162 @@ WEIGHT_VECTOR = 0.4
 WEIGHT_FTS = 0.4
 WEIGHT_RECENCY = 0.2
 
-# Track which providers have already logged a failure, so we warn once per cause
-# instead of spamming stderr on every memory write/search.
-_warned_embed: set[str] = set()
+# Stopwords config
+STOPWORD_THRESHOLD = float(os.environ.get("STOPWORD_THRESHOLD", "0.15"))
+STOPWORD_SKIP_PLATFORMS = {"cc"}
+_stopword_cache: set[str] | None = None
+_stopword_cache_ts: float = 0
 
 
-def _warn_embed_once(provider: str, reason: str) -> None:
-    key = f"{provider}:{reason}"
-    if key in _warned_embed:
-        return
-    _warned_embed.add(key)
-    print(
-        f"[imprint-memory] embedding provider '{provider}' failed: {reason}. "
-        f"Vector search disabled; falling back to FTS5 keyword only.",
-        file=sys.stderr,
-        flush=True,
-    )
+# ─── Stopwords ──────────────────────────────────────────
+
+def build_stopwords(threshold: float | None = None) -> dict:
+    """Scan all pools, compute document frequency, update stopwords table.
+    Words appearing in >threshold fraction of documents are auto-stopped."""
+    global _stopword_cache, _stopword_cache_ts
+    if threshold is None:
+        threshold = STOPWORD_THRESHOLD
+
+    db = _get_db()
+    try:
+        from collections import Counter
+        doc_freq: dict[str, Counter] = {}
+
+        pools = [
+            ("conversation_log",
+             "SELECT content FROM conversation_log WHERE platform NOT IN ({}) AND content IS NOT NULL".format(
+                 ",".join(f"'{p}'" for p in STOPWORD_SKIP_PLATFORMS))),
+            ("memories",
+             "SELECT content FROM memories WHERE content IS NOT NULL"),
+            ("chunks",
+             "SELECT summary AS content FROM conversation_chunks WHERE summary IS NOT NULL"),
+        ]
+
+        pool_totals: dict[str, int] = {}
+        word_pool_counts: Counter = Counter()
+
+        for pool_name, sql in pools:
+            rows = db.execute(sql).fetchall()
+            pool_totals[pool_name] = len(rows)
+            for r in rows:
+                content = r["content"] or ""
+                if _JIEBA_OK:
+                    from jieba import cut
+                    words = set(w.strip().lower() for w in cut(content) if w.strip())
+                else:
+                    words = set(re.findall(r'[一-鿿]+|[a-zA-Z]+', content.lower()))
+                for w in words:
+                    if len(w) >= 1:
+                        word_pool_counts[w] += 1
+
+        total_docs = sum(pool_totals.values())
+        if total_docs == 0:
+            return {"ok": True, "total": 0, "auto": 0}
+
+        now = now_str()
+        preserved = set()
+        for r in db.execute("SELECT word FROM stopwords WHERE source IN ('manual', 'keep')").fetchall():
+            preserved.add(r["word"])
+
+        db.execute("DELETE FROM stopwords WHERE source = 'auto'")
+
+        auto_count = 0
+        all_freqs = []
+        for word, count in word_pool_counts.items():
+            freq = count / total_docs
+            if freq >= threshold and word not in preserved:
+                db.execute(
+                    "INSERT OR REPLACE INTO stopwords (word, doc_freq, source, active, updated_at) VALUES (?, ?, 'auto', 1, ?)",
+                    (word, freq, now))
+                auto_count += 1
+            all_freqs.append((word, freq))
+
+        db.commit()
+
+        _stopword_cache = None
+        _stopword_cache_ts = 0
+
+        return {"ok": True, "total_docs": total_docs, "auto_stopwords": auto_count, "threshold": threshold}
+    finally:
+        db.close()
+
+
+def get_stopwords(force_refresh: bool = False) -> set[str]:
+    """Get active stopwords set. Cached for 10 minutes."""
+    global _stopword_cache, _stopword_cache_ts
+    import time
+    if not force_refresh and _stopword_cache is not None and (time.time() - _stopword_cache_ts) < 600:
+        return _stopword_cache
+
+    db = _get_db()
+    try:
+        rows = db.execute("SELECT word FROM stopwords WHERE active = 1").fetchall()
+        _stopword_cache = {r["word"] for r in rows}
+        _stopword_cache_ts = time.time()
+        return _stopword_cache
+    finally:
+        db.close()
+
+
+def list_stopwords() -> list[dict]:
+    """List all stopwords with their metadata."""
+    db = _get_db()
+    try:
+        rows = db.execute(
+            "SELECT word, doc_freq, source, active FROM stopwords ORDER BY doc_freq DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        db.close()
+
+
+def add_stopword(word: str) -> dict:
+    """Manually add a stopword."""
+    global _stopword_cache, _stopword_cache_ts
+    word = word.strip().lower()
+    if not word:
+        return {"ok": False, "error": "empty word"}
+    db = _get_db()
+    try:
+        db.execute(
+            "INSERT OR REPLACE INTO stopwords (word, doc_freq, source, active, updated_at) VALUES (?, 0, 'manual', 1, ?)",
+            (word, now_str()))
+        db.commit()
+        _stopword_cache = None
+        _stopword_cache_ts = 0
+        return {"ok": True, "added": word}
+    finally:
+        db.close()
+
+
+def remove_stopword(word: str) -> dict:
+    """Remove a stopword. Manual words are deleted; auto words are re-tagged as 'keep' so rebuilds don't re-add them."""
+    global _stopword_cache, _stopword_cache_ts
+    word = word.strip().lower()
+    db = _get_db()
+    try:
+        row = db.execute("SELECT source FROM stopwords WHERE word = ?", (word,)).fetchone()
+        if not row:
+            return {"ok": False, "error": f"'{word}' not in stopwords"}
+        if row["source"] == "manual":
+            db.execute("DELETE FROM stopwords WHERE word = ?", (word,))
+        else:
+            db.execute("UPDATE stopwords SET source = 'keep', active = 0, updated_at = ? WHERE word = ?", (now_str(), word))
+        db.commit()
+        _stopword_cache = None
+        _stopword_cache_ts = 0
+        return {"ok": True, "removed": word}
+    finally:
+        db.close()
+
+
+def filter_stopwords(terms: list[str]) -> list[str]:
+    """Remove stopwords from a list of query terms."""
+    stops = get_stopwords()
+    if not stops:
+        return terms
+    filtered = [t for t in terms if t.lower() not in stops]
+    return filtered if filtered else terms[:1]
 
 
 # ─── Vector Embeddings ───────────────────────────────────
@@ -94,9 +237,8 @@ def _embed_ollama(text: str) -> Optional[list[float]]:
             embeddings = data.get("embeddings", [])
             if embeddings and len(embeddings[0]) > 0:
                 return embeddings[0]
-            _warn_embed_once("ollama", f"empty response from {OLLAMA_URL} (model '{EMBED_MODEL}' pulled?)")
-    except Exception as e:
-        _warn_embed_once("ollama", f"{type(e).__name__}: {e} (URL={OLLAMA_URL}, model={EMBED_MODEL})")
+    except Exception:
+        pass
     return None
 
 
@@ -105,7 +247,6 @@ def _embed_openai(text: str) -> Optional[list[float]]:
     Works with: OpenAI, Voyage AI, Azure OpenAI, any OpenAI-compatible service.
     Set EMBED_API_BASE to point to your provider."""
     if not OPENAI_API_KEY:
-        _warn_embed_once("openai", "OPENAI_API_KEY not set")
         return None
     try:
         url = f"{EMBED_API_BASE.rstrip('/')}/v1/embeddings"
@@ -123,9 +264,8 @@ def _embed_openai(text: str) -> Optional[list[float]]:
             items = data.get("data", [])
             if items and "embedding" in items[0]:
                 return items[0]["embedding"]
-            _warn_embed_once("openai", f"empty response from {EMBED_API_BASE} (model={EMBED_MODEL})")
-    except Exception as e:
-        _warn_embed_once("openai", f"{type(e).__name__}: {e} (base={EMBED_API_BASE}, model={EMBED_MODEL})")
+    except Exception:
+        pass
     return None
 
 
@@ -144,7 +284,6 @@ def _embed_google(text: str, image_path: Optional[str] = None) -> Optional[list[
     Supports text and optional image (multimodal)."""
     api_key = _next_google_key()
     if not api_key:
-        _warn_embed_once("google", "no API key (set GOOGLE_API_KEYS or GOOGLE_API_KEY)")
         return None
     try:
         url = (
@@ -179,9 +318,8 @@ def _embed_google(text: str, image_path: Optional[str] = None) -> Optional[list[
             values = embedding.get("values", [])
             if values:
                 return values
-            _warn_embed_once("google", f"empty response (model={EMBED_MODEL})")
-    except Exception as e:
-        _warn_embed_once("google", f"{type(e).__name__}: {e} (model={EMBED_MODEL})")
+    except Exception:
+        pass
     return None
 
 
@@ -390,6 +528,8 @@ def search(query: str, limit: int = 10, category: Optional[str] = None) -> list[
     # 1. FTS5 keyword search
     try:
         fts_query = segment_cjk(sanitize_fts_query(query))
+        fts_terms = filter_stopwords(fts_query.split()) if fts_query else []
+        fts_query = " ".join(fts_terms) if fts_terms else ""
         if not fts_query:
             fts_query = query.replace('"', '""')
         cat_filter = "AND m.category = ?" if category else ""
@@ -995,12 +1135,15 @@ def _days_since(time_str: str, default: float = 30.0) -> float:
 
 
 def _fts_query_cjk(query: str) -> str:
-    """Build an FTS5 MATCH expression with proper CJK tokenization."""
+    """Build an FTS5 MATCH expression with proper CJK tokenization.
+    Uses OR so matching any term counts (not all terms required)."""
     if not _CJK_RE.search(query):
-        return query
+        terms = query.split()
+        return " OR ".join(terms) if len(terms) > 1 else query
 
     if _JIEBA_OK:
-        return segment_cjk(query)
+        terms = [t for t in segment_cjk(query).split() if t.strip()]
+        return " OR ".join(terms) if len(terms) > 1 else (terms[0] if terms else query)
 
     parts = re.split(r'([\u4e00-\u9fff\u3400-\u4dbf\U00020000-\U0002a6df'
                      r'\U0002a700-\U0002ebef\u3000-\u303f\uff00-\uffef]+)', query)
@@ -1021,12 +1164,273 @@ def _fts_query_cjk(query: str) -> str:
 
 
 def _sanitize_fts(query: str) -> str:
-    """Strip FTS5 operators and apply CJK segmentation."""
+    """Strip FTS5 operators, remove stopwords, and apply CJK segmentation."""
     cleaned = re.sub(r'["\(\)\*\:\^\{\}]', " ", query)
     cleaned = " ".join(cleaned.split()).strip()
     if not cleaned:
         return cleaned
-    return _fts_query_cjk(cleaned)
+    segmented = _fts_query_cjk(cleaned)
+    terms = segmented.split()
+    filtered = filter_stopwords(terms)
+    return " ".join(filtered)
+
+
+# ─── Chunk + Graph Search Channel ────────────────────────
+
+def _search_chunk_channels(query_vec, db, query="", limit=20):
+    """Return (fts_ranking, vec_ranking, details) for chunk pool with graph expansion."""
+    fts_ranking = []
+    vec_ranking = []
+    details = {}
+
+    # FTS5 search on chunk summaries
+    try:
+        fts_q = _fts_query_cjk(query) if query else ""
+        if fts_q:
+            fts_q = _sanitize_fts(fts_q)
+        if fts_q:
+            fts_rows = db.execute(
+                """SELECT c.id, c.start_msg_id, c.end_msg_id, c.msg_count,
+                          c.summary, c.keywords, c.embedding, c.start_time, c.end_time
+                   FROM chunks_fts f
+                   JOIN conversation_chunks c ON f.rowid = c.id
+                   WHERE chunks_fts MATCH ?
+                   LIMIT ?""",
+                (fts_q, limit),
+            ).fetchall()
+            for idx, row in enumerate(fts_rows):
+                key = f"chunk_{row['id']}"
+                fts_ranking.append((key, idx + 1))
+                if key not in details:
+                    details[key] = {
+                        "id": row["id"],
+                        "content": f"[回忆] {row['summary']}",
+                        "created_at": row["start_time"],
+                        "summary": row["summary"],
+                        "keywords": row["keywords"],
+                        "start_time": row["start_time"],
+                        "end_time": row["end_time"],
+                        "msg_count": row["msg_count"],
+                        "start_msg_id": row["start_msg_id"],
+                        "end_msg_id": row["end_msg_id"],
+                    }
+    except Exception:
+        pass
+
+    if not query_vec:
+        return fts_ranking, vec_ranking, details
+
+    try:
+        rows = db.execute(
+            """SELECT id, start_msg_id, end_msg_id, msg_count, platforms,
+                      summary, keywords, embedding, start_time, end_time
+               FROM conversation_chunks WHERE embedding IS NOT NULL"""
+        ).fetchall()
+    except Exception:
+        return fts_ranking, vec_ranking, details
+
+    scored = []
+    for row in rows:
+        blob = row["embedding"]
+        if not blob:
+            continue
+        vec = _blob_to_vec(blob)
+        sim = _cosine_similarity(query_vec, vec)
+        if sim > 0:
+            scored.append((sim, row))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    # Seeds
+    seed_ids = set()
+    for idx, (sim, row) in enumerate(scored[:limit]):
+        key = f"chunk_{row['id']}"
+        vec_ranking.append((key, idx + 1))
+        if key not in details:
+            details[key] = {
+                "id": row["id"],
+                "content": f"[回忆] {row['summary']}",
+                "created_at": row["start_time"],
+                "vec_similarity": sim,
+                "summary": row["summary"],
+                "keywords": row["keywords"],
+                "start_time": row["start_time"],
+                "end_time": row["end_time"],
+                "msg_count": row["msg_count"],
+                "start_msg_id": row["start_msg_id"],
+                "end_msg_id": row["end_msg_id"],
+            }
+        else:
+            details[key]["vec_similarity"] = sim
+        seed_ids.add(row["id"])
+
+    # Graph expansion: follow edges from top-5 seeds
+    try:
+        for seed_id in list(seed_ids)[:5]:
+            neighbors = db.execute(
+                """SELECT target_id, similarity FROM chunk_edges
+                   WHERE source_id = ? ORDER BY similarity DESC LIMIT 2""",
+                (seed_id,),
+            ).fetchall()
+            for n in neighbors:
+                tid = n["target_id"]
+                nkey = f"chunk_{tid}"
+                if nkey in details:
+                    continue
+                chunk = db.execute(
+                    """SELECT id, summary, keywords, start_time, end_time, msg_count
+                       FROM conversation_chunks WHERE id = ?""",
+                    (tid,),
+                ).fetchone()
+                if chunk:
+                    rank = len(vec_ranking) + 1
+                    vec_ranking.append((nkey, rank))
+                    details[nkey] = {
+                        "id": chunk["id"],
+                        "content": f"[回忆] {chunk['summary']}",
+                        "created_at": chunk["start_time"],
+                        "vec_similarity": n["similarity"] * 0.7,
+                        "summary": chunk["summary"],
+                        "keywords": chunk["keywords"],
+                        "start_time": chunk["start_time"],
+                        "end_time": chunk["end_time"],
+                        "msg_count": chunk["msg_count"],
+                    }
+    except Exception:
+        pass
+
+    _inject_default_ranks(fts_ranking, vec_ranking)
+    return fts_ranking, vec_ranking, details
+
+
+def _search_fact_channels(query_vec, db, limit=30):
+    """Search chunk_facts by vector, but return parent chunk as the result.
+    Facts are search indices; chunks are the actual memories."""
+    vec_ranking = []
+    details = {}
+    if not query_vec:
+        return vec_ranking, details
+    try:
+        rows = db.execute(
+            """SELECT f.id, f.chunk_id, f.content as fact_content, f.embedding,
+                      c.summary, c.keywords, c.start_time, c.end_time, c.msg_count
+               FROM chunk_facts f
+               JOIN conversation_chunks c ON f.chunk_id = c.id
+               WHERE f.embedding IS NOT NULL"""
+        ).fetchall()
+    except Exception:
+        return vec_ranking, details
+
+    scored = []
+    for row in rows:
+        blob = row["embedding"]
+        if not blob:
+            continue
+        vec = _blob_to_vec(blob)
+        sim = _cosine_similarity(query_vec, vec)
+        if sim > 0.3:
+            scored.append((sim, row))
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    seen_chunks = set()
+    for idx, (sim, row) in enumerate(scored[:limit]):
+        chunk_id = row["chunk_id"]
+        if chunk_id in seen_chunks:
+            continue
+        seen_chunks.add(chunk_id)
+        key = f"fact_{row['id']}"
+        vec_ranking.append((key, idx + 1))
+        details[key] = {
+            "id": chunk_id,
+            "content": f"[匹配] {row['fact_content']}\n[回忆] {row['summary']}",
+            "matched_fact": row["fact_content"],
+            "summary": row["summary"],
+            "created_at": row["start_time"],
+            "vec_similarity": sim,
+            "start_time": row["start_time"],
+            "end_time": row["end_time"],
+            "msg_count": row["msg_count"],
+        }
+
+    return vec_ranking, details
+
+
+# ─── LLM Rerank ─────────────────────────────────────────
+
+_CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID", "")
+_CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "")
+_CF_RERANK_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+
+_RERANK_PROMPT = """给每条候选结果打相关性分（0-10），只输出JSON数组。
+
+查询：{query}
+
+候选：
+{candidates}
+
+输出格式（严格JSON，不要其他内容）：
+[{{"idx":0,"score":8}},{{"idx":1,"score":3}},...]
+
+打分标准：
+- 10=完全相关，直接回答查询
+- 7-9=高度相关，包含关键信息
+- 4-6=部分相关，有些关联但不直接
+- 1-3=几乎不相关
+- 0=完全无关"""
+
+
+def _llm_rerank(query: str, candidates: list[dict]) -> list[dict]:
+    if not _CF_ACCOUNT_ID or not _CF_API_TOKEN or not candidates:
+        return candidates
+
+    cand_text = "\n".join(
+        f"[{i}] {r.get('content', '')[:200]}"
+        for i, r in enumerate(candidates)
+    )
+    prompt = _RERANK_PROMPT.format(query=query, candidates=cand_text)
+
+    url = f"https://api.cloudflare.com/client/v4/accounts/{_CF_ACCOUNT_ID}/ai/run/{_CF_RERANK_MODEL}"
+    payload = json.dumps({
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 300,
+        "temperature": 0.0,
+    }).encode()
+    req = urllib.request.Request(
+        url, data=payload,
+        headers={
+            "Authorization": f"Bearer {_CF_API_TOKEN}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+            r = data.get("result", {}).get("response", "")
+            if isinstance(r, list):
+                scores = r
+            else:
+                raw = r if isinstance(r, str) else json.dumps(r)
+                raw = re.sub(r'[\x00-\x1f\x7f]', ' ', raw)
+                raw = re.sub(r'```(?:json)?\s*', '', raw)
+                start = raw.find('[')
+                end = raw.rfind(']')
+                if start == -1 or end == -1:
+                    return candidates
+                scores = json.loads(raw[start:end + 1])
+
+            score_map = {s["idx"]: s["score"] for s in scores if "idx" in s and "score" in s}
+            for i, r in enumerate(candidates):
+                llm_score = score_map.get(i, 0)
+                r["llm_rerank_score"] = llm_score
+                rrf_score = r.get("score", 0)
+                r["score"] = rrf_score * 0.5 + (llm_score / 10.0) * 0.5
+
+            candidates.sort(key=lambda x: x["score"], reverse=True)
+            return candidates
+
+    except Exception as e:
+        print(f"LLM rerank failed: {e}")
+        return candidates
 
 
 # ─── RRF Core ───────────────────────────────────────────
@@ -1073,7 +1477,7 @@ def _inject_default_ranks(
 # ─── Rerank Functions ───────────────────────────────────
 
 def _rerank_memory(rrf_score: float, row: dict) -> float:
-    """Memory rerank: time x activation x importance, blended with RRF."""
+    """Memory rerank: time x activation x importance x specificity, blended with RRF."""
     if row.get("pinned"):
         return rrf_score
 
@@ -1088,7 +1492,10 @@ def _rerank_memory(rrf_score: float, row: dict) -> float:
     activation_factor = 0.8 + 0.2 * (math.log(recalled + 1) / math.log(51))
     importance_factor = 0.7 + 0.3 * (importance / 10)
 
-    factor = time_factor * activation_factor * importance_factor
+    content_len = len(row.get("content", ""))
+    specificity = min(1.0, 0.5 + 0.5 * (content_len / 40)) if content_len < 40 else 1.0
+
+    factor = time_factor * activation_factor * importance_factor * specificity
     return rrf_score * (1 - RERANK_BLEND + RERANK_BLEND * factor)
 
 
@@ -1108,8 +1515,8 @@ def _rerank_bank(rrf_score: float, row: dict) -> float:
 
 
 def _rerank_conv(rrf_score: float, row: dict) -> float:
-    """Conversation rerank: recency (7-day half-life)."""
-    days = _days_since(row.get("created_at", ""), default=30)
+    """Conversation/chunk rerank: recency (7-day half-life)."""
+    days = _days_since(row.get("created_at") or row.get("start_time", ""), default=30)
     recency = 0.3 + 0.7 * math.exp(-days / 7)
     return rrf_score * (1 - RERANK_BLEND + RERANK_BLEND * recency)
 
@@ -1318,6 +1725,83 @@ def _search_conv_channels(query, query_vec, db, *, platform="", limit=50):
     return fts_ranking, vec_ranking, like_ranking, details
 
 
+# ─── Chunk Keyword Expansion ─────────────────────────────
+
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+def _expand_chunk_hybrid(query: str, query_vec, results: list[dict], db, max_msgs: int = 5) -> None:
+    """Expand chunk results with hybrid keyword + embedding ranked messages.
+    Short chunks (<=15 msgs): keyword-only (fast, sufficient).
+    Long chunks: embedding baseline + keyword boost."""
+    if _JIEBA_OK:
+        from jieba import cut
+        query_terms = [w.strip().lower() for w in cut(query) if len(w.strip()) >= 2]
+    else:
+        query_terms = [w.lower() for w in query.split() if len(w) >= 2]
+    query_terms = filter_stopwords(query_terms)
+    if not query_terms:
+        query_terms = [w.lower() for w in query.split() if len(w) >= 2]
+    term_set = set(query_terms)
+
+    for r in results:
+        if r.get("pool") != "chunk":
+            continue
+        sid = r.get("start_msg_id")
+        eid = r.get("end_msg_id")
+        if not sid or not eid:
+            continue
+
+        msgs = db.execute(
+            """SELECT id, direction, speaker, content
+               FROM conversation_log
+               WHERE id BETWEEN ? AND ? AND platform NOT IN ('cc')
+               ORDER BY id""",
+            (sid, eid),
+        ).fetchall()
+
+        use_embedding = query_vec and len(msgs) > 15
+
+        scored = []
+        for m in msgs:
+            raw = m["content"] or ""
+            clean = _THINK_RE.sub("", raw).strip()
+            if len(clean) < 5:
+                continue
+
+            # Keyword score
+            lower = clean.lower()
+            kw_matched = sum(1 for t in term_set if t in lower)
+            kw_score = kw_matched / len(term_set) if term_set else 0
+
+            # Embedding score (only for long chunks)
+            emb_score = 0.0
+            if use_embedding:
+                vrow = db.execute(
+                    "SELECT embedding FROM conversation_vectors WHERE msg_id = ?",
+                    (m["id"],),
+                ).fetchone()
+                if vrow and vrow["embedding"]:
+                    vec = _blob_to_vec(vrow["embedding"])
+                    emb_score = _cosine_similarity(query_vec, vec)
+
+            # Hybrid: embedding as base, keyword as boost
+            if use_embedding:
+                score = emb_score + kw_score * 0.3
+            else:
+                score = kw_score
+
+            speaker = m["speaker"] or (USER_NAME if m["direction"] == "in" else AGENT_NAME)
+            scored.append((score, m["id"], speaker, clean[:300]))
+
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        top = [s for s in scored if s[0] > 0][:max_msgs]
+        if not top:
+            top = scored[:max_msgs]
+
+        top.sort(key=lambda x: x[1])
+        r["expanded"] = [{"speaker": s, "content": c} for _, _, s, c in top]
+
+
 # ─── Graph Expansion ───────────────────────────────────
 
 def _expand_via_edges(results: list[dict], db, max_expand: int = 3) -> list[dict]:
@@ -1374,6 +1858,43 @@ def _expand_via_edges(results: list[dict], db, max_expand: int = 3) -> list[dict
     return results + expanded
 
 
+# ─── Query Expansion ─────────────────────────────────────
+
+_EXPAND_PROMPT = """这是一对情侣的聊天记录搜索。用户搜：{query}
+想想实际对话中可能出现的口语表达和相关情境词（不要书面语）。输出5个逗号分隔的词："""
+
+
+def _expand_query(query: str) -> str:
+    """Use LLM to expand a query with synonyms for better recall."""
+    if not _CF_ACCOUNT_ID or not _CF_API_TOKEN:
+        return query
+    if len(query) > 50:
+        return query
+    url = f"https://api.cloudflare.com/client/v4/accounts/{_CF_ACCOUNT_ID}/ai/run/{_CF_RERANK_MODEL}"
+    payload = json.dumps({
+        "messages": [{"role": "user", "content": _EXPAND_PROMPT.format(query=query)}],
+        "max_tokens": 60,
+        "temperature": 0.0,
+    }).encode()
+    req = urllib.request.Request(
+        url, data=payload,
+        headers={
+            "Authorization": f"Bearer {_CF_API_TOKEN}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read())
+            r = data.get("result", {}).get("response", "")
+            if isinstance(r, str) and r.strip():
+                expanded = query + " " + r.strip().replace("，", ",").replace(",", " ")
+                return expanded
+    except Exception:
+        pass
+    return query
+
+
 # ─── Unified Search ─────────────────────────────────────
 
 def unified_search(
@@ -1385,6 +1906,7 @@ def unified_search(
     after: str | None = None,
     before: str | None = None,
     _internal: bool = False,
+    rerank: bool = True,
 ) -> list[dict]:
     """Search across all memory pools with RRF fusion and per-pool reranking.
 
@@ -1400,43 +1922,60 @@ def unified_search(
         pool, score, rrf_raw, id, content, + pool-specific fields
     """
     if pools is None:
-        pools = ["memory", "bank", "conversation"]
+        pools = ["memory", "conversation"]
 
     if (after or before) and "bank" in pools:
         pools = [p for p in pools if p != "bank"]
 
+    expanded_query = _expand_query(query)
+
     db = _get_db()
-    query_vec = _embed(query)
+    query_vec = _embed(expanded_query if expanded_query != query else query)
     all_rankings: list[list[tuple[str, int]]] = []
     all_details: dict[str, dict] = {}
 
     if "memory" in pools:
         m_fts, m_vec, m_like, m_det = _search_memory_channels(
-            query, query_vec, db, category=category
+            expanded_query, query_vec, db, category=category
         )
         _inject_default_ranks(m_fts, m_vec)
         all_rankings += [m_fts, m_vec, m_like]
         all_details.update(m_det)
 
     if "bank" in pools:
-        b_fts, b_vec, b_like, b_det = _search_bank_channels(query, query_vec, db)
+        b_fts, b_vec, b_like, b_det = _search_bank_channels(expanded_query, query_vec, db)
         _inject_default_ranks(b_fts, b_vec)
         all_rankings += [b_fts, b_vec, b_like]
         all_details.update(b_det)
 
     if "conversation" in pools:
         c_fts, c_vec, c_like, c_det = _search_conv_channels(
-            query, query_vec, db, platform=platform
+            expanded_query, query_vec, db, platform=platform
         )
         if c_vec:
             _inject_default_ranks(c_fts, c_vec)
         all_rankings += [c_fts, c_vec, c_like]
         all_details.update(c_det)
 
+        # Chunk search: FTS + vector + graph expansion
+        ch_fts, ch_vec, ch_det = _search_chunk_channels(query_vec, db, query=expanded_query)
+        if ch_fts:
+            all_rankings.append(ch_fts)
+        if ch_vec:
+            all_rankings.append(ch_vec)
+        all_details.update(ch_det)
+
+        # Chunk facts: disabled — quality too low from batch LLM extraction.
+        # Facts will be manually curated by North during heartbeat instead.
+        # f_vec, f_det = _search_fact_channels(query_vec, db)
+        # if f_vec:
+        #     all_rankings.append(f_vec)
+        #     all_details.update(f_det)
+
     rrf_scores = _rrf_fuse(all_rankings)
 
     # Per-pool rerank + within-pool normalisation
-    pool_items: dict[str, list[dict]] = {"memory": [], "bank": [], "conversation": []}
+    pool_items: dict[str, list[dict]] = {"memory": [], "bank": [], "conversation": [], "chunk": [], "fact": []}
 
     for key, rrf in rrf_scores.items():
         detail = all_details.get(key, {})
@@ -1447,6 +1986,12 @@ def unified_search(
         elif key.startswith("bank_"):
             pool = "bank"
             reranked = _rerank_bank(rrf, detail)
+        elif key.startswith("chunk_"):
+            pool = "chunk"
+            reranked = _rerank_conv(rrf, detail)
+        elif key.startswith("fact_"):
+            pool = "fact"
+            reranked = _rerank_conv(rrf, detail)
         elif key.startswith("conv_"):
             pool = "conversation"
             reranked = _rerank_conv(rrf, detail)
@@ -1462,54 +2007,106 @@ def unified_search(
         })
 
     # Normalise within each pool, scaled by pool confidence.
-    # Pool confidence uses best vec_similarity — the only signal with real relevance discrimination.
     results: list[dict] = []
     for pool, items in pool_items.items():
         if not items:
             continue
         max_score = max(r["score"] for r in items)
         max_vec = max((r.get("vec_similarity") or 0) for r in items)
+        has_fts = any(r.get("rrf_raw", 0) > 0.02 for r in items)
         if max_vec >= VEC_CONFIDENCE_GOOD:
             pool_conf = 1.0
+        elif has_fts:
+            pool_conf = max(0.6, 0.15 + 0.85 * max(0, (max_vec - VEC_CONFIDENCE_NOISE)) / (VEC_CONFIDENCE_GOOD - VEC_CONFIDENCE_NOISE))
         elif max_vec <= VEC_CONFIDENCE_NOISE:
-            pool_conf = 0.0
+            pool_conf = 0.15
         else:
-            pool_conf = (max_vec - VEC_CONFIDENCE_NOISE) / (VEC_CONFIDENCE_GOOD - VEC_CONFIDENCE_NOISE)
+            pool_conf = 0.15 + 0.85 * (max_vec - VEC_CONFIDENCE_NOISE) / (VEC_CONFIDENCE_GOOD - VEC_CONFIDENCE_NOISE)
         for r in items:
             r["score"] = (r["score"] / max_score * pool_conf) if max_score > 0 else 0
         results.extend(items)
 
-    # Keyword presence boost: results containing query terms get a bonus.
-    # This prevents semantically vague matches from outranking exact keyword hits.
     _KEYWORD_BOOST = 0.3
-    query_terms = query.split() if " " in query else [query]
+    if _JIEBA_OK:
+        from jieba import cut
+        query_terms = filter_stopwords([w for w in cut(query) if w.strip()])
+    else:
+        query_terms = filter_stopwords(query.split() if " " in query else [query])
     for r in results:
         content = r.get("content", "")
         matched = sum(1 for t in query_terms if t in content)
         if matched:
             r["score"] += _KEYWORD_BOOST * (matched / len(query_terms))
 
-    results = [r for r in results if r["score"] >= POST_NORM_FLOOR]
+    floor = POST_NORM_FLOOR * 0.3 if rerank else POST_NORM_FLOOR
+    results = [r for r in results if r["score"] >= floor]
     results.sort(key=lambda x: x["score"], reverse=True)
 
-    # Time range filtering (after/before)
+    # Noise filter: skip when reranker is on (reranker handles relevance)
+    if not rerank and results:
+        top_score = results[0]["score"]
+        noise_floor = top_score * 0.5
+        results = [r for r in results if r["score"] >= noise_floor]
+
+    # Dedup: overlapping chunks keep only the higher-scored one
+    kept_ranges = []
+    deduped = []
+    for r in results:
+        if r.get("pool") == "chunk":
+            sid = r.get("start_msg_id")
+            eid = r.get("end_msg_id")
+            if sid and eid:
+                overlaps = any(not (eid < ks or sid > ke) for ks, ke in kept_ranges)
+                if overlaps:
+                    continue
+                kept_ranges.append((sid, eid))
+        deduped.append(r)
+    results = deduped
+
+    # Dedup: conversation messages covered by a chunk's range → drop
+    chunk_ranges = [(ks, ke) for ks, ke in kept_ranges]
+    if chunk_ranges:
+        def _not_covered_by_chunk(r):
+            if r.get("pool") != "conversation":
+                return True
+            msg_id = r.get("id")
+            if not msg_id:
+                return True
+            return not any(s <= msg_id <= e for s, e in chunk_ranges)
+        results = [r for r in results if _not_covered_by_chunk(r)]
+
+    # Time range: soft boost (in-range results get +0.5), not hard filter
     if after or before:
-        def _in_time_range(r):
+        _TIME_BOOST = 0.5
+        for r in results:
             ts = r.get("created_at", "")
             if not ts:
-                return True  # keep items without timestamp
+                continue
+            in_range = True
             if after and ts < after:
-                return False
+                in_range = False
             if before and ts > before:
-                return False
-            return True
-        results = [r for r in results if _in_time_range(r)]
+                in_range = False
+            if in_range:
+                r["score"] += _TIME_BOOST
+        results.sort(key=lambda x: x["score"], reverse=True)
+
+    # Filter out PRIVATE-tagged memories
+    results = [r for r in results if not (r.get("content", "").startswith("[PRIVATE]"))]
+
+    # LLM rerank: take top-20 candidates, ask LLM to score relevance
+    if rerank and len(results) > 3:
+        results = _llm_rerank(query, results[:20])
 
     results = results[:limit]
 
     # Graph expansion: append edge-connected memories
     if "memory" in pools:
         results = _expand_via_edges(results, db, max_expand=3)
+
+    # Expand chunk results with hybrid keyword + embedding ranked messages
+    if any(r.get("pool") == "chunk" for r in results):
+        _expand_chunk_hybrid(query, query_vec, results, db)
 
     # Side-effect: update last_accessed_at + recalled_count
     if not _internal:
@@ -1535,6 +2132,57 @@ _LOCALE_LABELS = {
            "empty": "没有找到匹配的结果"},
 }
 
+try:
+    import jionlp as _jio
+    _JIO_OK = True
+except ImportError:
+    _jio = None
+    _JIO_OK = False
+
+_FUZZY_TIME_PATTERNS = [
+    (r'最近几天|这几天', 7),
+    (r'最近', 14),
+    (r'上次|前几天|前两天', 14),
+    (r'前段时间', 21),
+]
+
+
+def _extract_time_intent(query: str) -> tuple[str, str | None, str | None]:
+    """Extract time intent from query, return (cleaned_query, after, before).
+    Uses jionlp for precise parsing, falls back to regex for fuzzy terms."""
+    today = now_local()
+
+    # Fuzzy patterns that jionlp can't handle
+    for pattern, days_back in _FUZZY_TIME_PATTERNS:
+        if re.search(pattern, query):
+            cleaned = re.sub(pattern, '', query).strip()
+            if not cleaned:
+                cleaned = query
+            after_date = (today - timedelta(days=days_back)).strftime("%Y-%m-%d")
+            return cleaned, after_date, None
+
+    # jionlp: handles 昨天/三周前/4月初/去年冬天/上半年 etc.
+    if _JIO_OK:
+        try:
+            result = _jio.parse_time(
+                query,
+                time_base={"year": today.year, "month": today.month, "day": today.day},
+            )
+            if result and result.get("time"):
+                t = result["time"]
+                after_date = t[0][:10]
+                before_date = t[1][:10]
+                time_str = result.get("time_string", "")
+                cleaned = query.replace(time_str, "").strip() if time_str else query
+                if not cleaned:
+                    cleaned = query
+                return cleaned, after_date, before_date
+        except Exception:
+            pass
+
+    return query, None, None
+
+
 def unified_search_text(
     query: str,
     limit: int = 10,
@@ -1545,7 +2193,14 @@ def unified_search_text(
 ) -> str:
     """Format unified search results as readable text.
     Set IMPRINT_LOCALE=zh for Chinese labels, default English.
-    after/before: ISO date strings to filter by time range."""
+    after/before: ISO date strings to filter by time range.
+    Auto-detects time intent from query (最近/上次/昨天 etc.)."""
+    if not after and not before:
+        query, auto_after, auto_before = _extract_time_intent(query)
+        if auto_after:
+            after = auto_after
+        if auto_before:
+            before = auto_before
     results = unified_search(query, limit=limit, pools=pools, platform=platform, after=after, before=before)
     locale = os.environ.get("IMPRINT_LOCALE", "en")
     loc = _LOCALE_LABELS.get(locale, _LOCALE_LABELS["en"])
@@ -1554,33 +2209,192 @@ def unified_search_text(
 
     _labels = {k: loc[k] for k in ("memory", "bank", "conversation")}
     lines: list[str] = []
+    edge_lines: list[str] = []
 
     for r in results:
         label = _labels.get(r["pool"], r["pool"])
-        score = f"{r['score']:.4f}"
-        content = r.get("content", "")[:200]
+        score = r.get("score", 0)
+        content = r.get("content", "")[:120]
+
+        # Memory edge expansions → collect for the "关联" section
+        if r.get("source") == "edge":
+            rel = r.get("edge_relation", "")
+            edge_lines.append(f"[Memory|edge|{rel}] {content}")
+            continue
+
+        if score <= 0:
+            continue
 
         if r["pool"] == "memory":
             cat = r.get("category", "")
             ts = r.get("created_at", "")
             pin = " [pinned]" if r.get("pinned") else ""
-            if r.get("source") == "edge":
-                rel = r.get("edge_relation", "")
-                lines.append(f"[{label}|edge|{rel}] {content}")
-            else:
-                lines.append(f"[{label}|{cat}|{ts}]{pin} ({score}) {content}")
+            lines.append(f"[{label}|{cat}|{ts}]{pin} ({score:.3f}) {content}")
 
         elif r["pool"] == "bank":
             src = r.get("source", "")
-            lines.append(f"[{label}|{src}] ({score}) {content}")
+            lines.append(f"[{label}|{src}] ({score:.3f}) {content}")
 
         elif r["pool"] == "conversation":
             plat = r.get("platform", "")
             dire = "<-" if r.get("direction") == "in" else "->"
             ts = r.get("created_at", "")
-            lines.append(f"[{label}|{plat}{dire}|{ts}] ({score}) {content}")
+            lines.append(f"[{label}|{plat}{dire}|{ts}] ({score:.3f}) {content}")
+
+        elif r["pool"] == "chunk":
+            ts = r.get("start_time", "")[:10]
+            kw = r.get("keywords", "")
+            lines.append(f"[Chunk|{ts}] ({score:.3f}) [{kw}] {content[:100]}")
+            for em in r.get("expanded", []):
+                lines.append(f"  {em['speaker']}: {em['content'][:200]}")
+
+    # Extra section: chunk graph expansion + memory edge expansion
+    extra = []
+    if "conversation" in (pools or ["memory", "bank", "conversation"]):
+        extra = _graph_expansion_section(query, results, limit=5)
+    extra.extend(edge_lines)
+
+    if extra:
+        lines.append("")
+        lines.append("--- 关联 ---")
+        lines.extend(extra)
 
     return "\n".join(lines)
+
+
+def surfacing_search(query: str, limit: int = 3) -> str:
+    """Compact memory surfacing for auto-recall during conversation.
+    Target ~400 chars: chunk summaries + top-1 expanded quote + 1 graph link."""
+    query = (query or "").strip()
+    if not query:
+        return ""
+    if len(set(query)) <= 1:
+        return ""
+    if _JIEBA_OK:
+        from jieba import cut
+        meaningful = [w for w in cut(query) if len(w.strip()) >= 2 and len(set(w.strip())) > 1]
+        if len(meaningful) < 1:
+            return ""
+    elif len(query) < 6:
+        return ""
+
+    search_query, after, before = _extract_time_intent(query)
+    results = unified_search(search_query or query, limit=limit, rerank=False, after=after, before=before)
+    if not results:
+        return ""
+
+    lines = []
+
+    for r in results:
+        if r.get("score", 0) <= 0 or r.get("source") == "edge":
+            continue
+
+        if r["pool"] == "memory":
+            content = r.get("content", "")[:60]
+            ts = (r.get("created_at", "") or "")[:10]
+            lines.append(f"[记忆|{ts}] {content}")
+
+        elif r["pool"] == "chunk":
+            summary = r.get("summary", r.get("content", ""))[:60]
+            ts = (r.get("start_time", "") or "")[:10]
+            lines.append(f"[{ts}] {summary}")
+            expanded = r.get("expanded", [])
+            if expanded:
+                lines.append(f"  {expanded[0]['speaker']}: {expanded[0]['content'][:80]}")
+
+        elif r["pool"] == "conversation":
+            content = r.get("content", "")[:60]
+            sp = r.get("speaker") or (USER_NAME if r.get("direction") == "in" else AGENT_NAME)
+            lines.append(f"[对话] {sp}: {content}")
+
+    if not lines:
+        return ""
+
+    graph = _graph_expansion_section(query, results, limit=1)
+    if graph:
+        lines.append(f"— {graph[0]}")
+
+    return "\n".join(lines)
+
+
+_GRAPH_EDGE_FLOOR = 0.75
+
+
+def _graph_expansion_section(query: str, rrf_results: list[dict], limit: int = 5) -> list[str]:
+    """Generate graph-expansion section.
+    Filters: edge score >= 0.75 AND neighbor must share at least one keyword with query."""
+    seen_ids = set()
+    seed_chunk_ids = []
+    for r in rrf_results:
+        if r.get("pool") == "chunk":
+            cid = r.get("id")
+            if cid:
+                seen_ids.add(cid)
+                seed_chunk_ids.append(cid)
+
+    if not seed_chunk_ids:
+        return []
+
+    if _JIEBA_OK:
+        from jieba import cut
+        query_terms = {w.strip().lower() for w in cut(query) if len(w.strip()) >= 2}
+    else:
+        query_terms = {w.lower() for w in query.split() if len(w) >= 2}
+
+    seed_keywords = set()
+    db = _get_db()
+    try:
+        for sid in seed_chunk_ids:
+            row = db.execute("SELECT keywords FROM conversation_chunks WHERE id = ?", (sid,)).fetchone()
+            if row and row["keywords"]:
+                seed_keywords.update(k.strip().lower() for k in row["keywords"].split(",") if k.strip())
+    except Exception:
+        pass
+
+    lines = []
+    try:
+        for seed_id in seed_chunk_ids[:3]:
+            neighbors = db.execute(
+                """SELECT ce.target_id, ce.similarity * ce.strength as score,
+                          c.summary, c.keywords, c.start_time
+                   FROM chunk_edges ce
+                   JOIN conversation_chunks c ON c.id = ce.target_id
+                   WHERE ce.source_id = ? AND ce.target_id NOT IN ({})
+                     AND ce.similarity * ce.strength >= ?
+                   ORDER BY score DESC LIMIT 5""".format(
+                    ",".join(str(i) for i in seen_ids) if seen_ids else "0"
+                ),
+                (seed_id, _GRAPH_EDGE_FLOOR),
+            ).fetchall()
+
+            for n in neighbors:
+                if n["target_id"] in seen_ids:
+                    continue
+
+                text = ((n["summary"] or "") + " " + (n["keywords"] or "")).lower()
+                if not any(t in text for t in query_terms):
+                    continue
+
+                n_kws = {k.strip().lower() for k in (n["keywords"] or "").split(",") if k.strip()}
+                if seed_keywords and n_kws:
+                    overlap = len(n_kws & seed_keywords) / max(len(n_kws), 1)
+                    if overlap > 0.3:
+                        continue
+
+                seen_ids.add(n["target_id"])
+                ts = (n["start_time"] or "")[:10]
+                kw = n["keywords"] or ""
+                summary = (n["summary"] or "")[:80]
+                lines.append(f"[Graph|{ts}] [{kw}] {summary}")
+
+                if len(lines) >= limit:
+                    return lines
+    except Exception:
+        pass
+    finally:
+        db.close()
+
+    return lines
 
 
 # ═══════════════════════════════════════════════════════════════
