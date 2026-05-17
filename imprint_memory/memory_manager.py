@@ -1819,6 +1819,117 @@ def _search_conv_channels(query, query_vec, db, *, platform="", limit=50):
     return fts_ranking, vec_ranking, like_ranking, details
 
 
+def _search_time_window(query_vec, db, after: str, before: str, limit: int = 20):
+    """In-range vec recall channel.
+
+    When the user pins a time range (e.g. "yesterday/last week/May 15"), the
+    standard channels rank globally and may push the most relevant in-range
+    content out of the top-K candidate pool — e.g. a chunk whose summary
+    abstracted "drank tequila" into "vulnerability/testing the relationship"
+    will have low cosine to the literal query "drank yesterday" and never
+    survive a global limit, even though it's the right answer.
+
+    This channel scopes vector ranking to candidates whose normalised day
+    falls inside [after, before], guaranteeing the best in-range hits enter
+    the candidate pool.
+
+    Returns (chunk_ranking, conv_ranking, details).
+    """
+    chunk_ranking: list[tuple[str, int]] = []
+    conv_ranking: list[tuple[str, int]] = []
+    details: dict[str, dict] = {}
+    if not query_vec or not after or not before:
+        return chunk_ranking, conv_ranking, details
+
+    # SQL pre-filter is intentionally loose: take a 1-day buffer on each side
+    # so boundary-hour shifts (e.g. early-morning hours mapping to prev day)
+    # don't drop edge timestamps. Python precise-filter via _ts_to_day applies
+    # the actual day-boundary rule.
+    try:
+        sql_after = (datetime.strptime(after, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+        sql_before = (datetime.strptime(before, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+    except Exception:
+        return chunk_ranking, conv_ranking, details
+
+    # ── Chunks in window ──
+    try:
+        rows = db.execute(
+            """SELECT id, start_msg_id, end_msg_id, msg_count, summary, keywords,
+                      embedding, start_time, end_time
+               FROM conversation_chunks
+               WHERE embedding IS NOT NULL
+                 AND substr(start_time, 1, 10) BETWEEN ? AND ?""",
+            (sql_after, sql_before),
+        ).fetchall()
+    except Exception:
+        rows = []
+
+    scored = []
+    for row in rows:
+        day = _ts_to_day(row["start_time"])
+        if not day or not (after <= day <= before):
+            continue
+        sim = _cosine_similarity(query_vec, _blob_to_vec(row["embedding"]))
+        scored.append((sim, row))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    for idx, (sim, row) in enumerate(scored[:limit]):
+        key = f"chunk_{row['id']}"
+        chunk_ranking.append((key, idx + 1))
+        details[key] = {
+            "id": row["id"],
+            "content": f"[回忆] {row['summary']}",
+            "created_at": row["start_time"],
+            "vec_similarity": sim,
+            "summary": row["summary"],
+            "keywords": row["keywords"],
+            "start_time": row["start_time"],
+            "end_time": row["end_time"],
+            "msg_count": row["msg_count"],
+            "start_msg_id": row["start_msg_id"],
+            "end_msg_id": row["end_msg_id"],
+        }
+
+    # ── Conversation messages in window ──
+    try:
+        rows = db.execute(
+            """SELECT c.id, c.platform, c.direction, c.speaker, c.content,
+                      c.created_at, v.embedding
+               FROM conversation_log c
+               JOIN conversation_vectors v ON v.msg_id = c.id
+               WHERE v.embedding IS NOT NULL
+                 AND substr(c.created_at, 1, 10) BETWEEN ? AND ?""",
+            (sql_after, sql_before),
+        ).fetchall()
+    except Exception:
+        rows = []
+
+    scored = []
+    for row in rows:
+        day = _ts_to_day(row["created_at"])
+        if not day or not (after <= day <= before):
+            continue
+        sim = _cosine_similarity(query_vec, _blob_to_vec(row["embedding"]))
+        scored.append((sim, row))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    for idx, (sim, row) in enumerate(scored[:limit]):
+        key = f"conv_{row['id']}"
+        conv_ranking.append((key, idx + 1))
+        if key not in details:
+            details[key] = {
+                "id": row["id"],
+                "platform": row["platform"],
+                "direction": row["direction"],
+                "speaker": row["speaker"],
+                "content": row["content"],
+                "created_at": row["created_at"],
+                "vec_similarity": sim,
+            }
+        else:
+            details[key]["vec_similarity"] = max(details[key].get("vec_similarity", 0), sim)
+
+    return chunk_ranking, conv_ranking, details
+
+
 # ─── Chunk Keyword Expansion ─────────────────────────────
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
@@ -2058,6 +2169,26 @@ def unified_search(
         if ch_vec:
             all_rankings.append(ch_vec)
         all_details.update(ch_det)
+
+        # Time-window channel: when the user pinned a precise time range,
+        # rank chunks/messages scoped to that window so in-range hits can't be
+        # crowded out of the candidate pool by globally-higher-but-irrelevant
+        # results.
+        if after and before:
+            tw_ch, tw_conv, tw_det = _search_time_window(query_vec, db, after, before)
+            if tw_ch:
+                all_rankings.append(tw_ch)
+            if tw_conv:
+                all_rankings.append(tw_conv)
+            for k, v in tw_det.items():
+                if k in all_details:
+                    if "vec_similarity" in v:
+                        all_details[k]["vec_similarity"] = max(
+                            all_details[k].get("vec_similarity", 0) or 0,
+                            v["vec_similarity"],
+                        )
+                else:
+                    all_details[k] = v
 
         # Chunk facts: disabled — quality too low from batch LLM extraction.
         # Facts will be manually curated by North during heartbeat instead.
