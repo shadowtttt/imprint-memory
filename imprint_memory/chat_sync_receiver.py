@@ -25,6 +25,7 @@ import math
 import os
 import re
 import struct
+import sys
 import threading
 import time
 
@@ -33,6 +34,45 @@ from starlette.background import BackgroundTask
 from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse
 from starlette.routing import Route
+
+
+# Load API keys from common conventional locations before anything imports the
+# embedding helper. Without an API key, embed_new_messages() silently no-ops via
+# the broad except — leaving conversation_vectors empty and search degraded with
+# no visible error.
+_KEY_FILES = [
+    os.path.join(os.getcwd(), ".env"),
+    os.path.expanduser("~/.imprint/keys.env"),
+    os.path.expanduser("~/.config/imprint/keys.env"),
+]
+for _kf in _KEY_FILES:
+    if not os.path.isfile(_kf):
+        continue
+    try:
+        for _line in open(_kf, encoding="utf-8"):
+            _line = _line.strip()
+            if not _line or _line.startswith("#") or "=" not in _line:
+                continue
+            if _line.startswith("export "):
+                _line = _line[len("export "):]
+            _k, _v = _line.split("=", 1)
+            os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
+    except Exception:
+        pass
+
+_EMBED_PROVIDER = os.environ.get("EMBED_PROVIDER", "google").lower()
+_KEY_VAR = {"google": "GOOGLE_API_KEY", "openai": "OPENAI_API_KEY"}.get(_EMBED_PROVIDER, "")
+if _KEY_VAR and not os.environ.get(_KEY_VAR) and not os.environ.get("GOOGLE_API_KEYS"):
+    print(
+        f"⚠️  WARNING: {_KEY_VAR} is not set in the environment. "
+        f"Per-message embedding (conversation_vectors) will be silently skipped, "
+        f"so chunk-expansion and message-level search will degrade to keyword-only.\n"
+        f"   Fix: export {_KEY_VAR}=... before launching, or drop a keys.env in one of:\n"
+        f"     " + "\n     ".join(_KEY_FILES),
+        file=sys.stderr,
+        flush=True,
+    )
+
 
 from .conversation import log_message, get_recent
 from .db import _get_db as _get_app_db
