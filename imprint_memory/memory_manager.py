@@ -2654,22 +2654,80 @@ def unified_search_text(
     return "\n".join(lines)
 
 
-_WINDOW_MARKER_RE = re.compile(r"\[当前对话窗口:\s*([A-Za-z0-9_\-]+)\s*\]")
+def _cc_context_cutoff(session_id: str) -> str:
+    """Find earliest timestamp still visible in the current cc session's
+    JSONL transcript. Anything in conversation_log dated at-or-after this
+    cutoff is already inside the cc prompt context (either authored in
+    the live session, or carried over by a forge-reload), so surfacing
+    it back is echo.
+
+    Returns "" when the session id can't be resolved to a JSONL file.
+    """
+    if not session_id:
+        return ""
+    try:
+        import json as _json
+        projects_dir = Path.home() / ".claude" / "projects"
+        if not projects_dir.is_dir():
+            return ""
+        for jsonl in projects_dir.rglob(f"{session_id}.jsonl"):
+            try:
+                with jsonl.open(encoding="utf-8") as f:
+                    first_line = f.readline().strip()
+                if not first_line:
+                    continue
+                obj = _json.loads(first_line)
+                ts = obj.get("timestamp") or ""
+                if ts:
+                    return ts
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return ""
+
+
+def _parse_ts(ts: str):
+    """Parse a stored timestamp into a tz-aware datetime in LOCAL_TZ.
+
+    Handles three formats we see in conversation_log / conversation_chunks:
+      - '2026-05-18 00:23:12'              (naive — assumed already local)
+      - '2026-05-17T13:00:39.855Z'         (UTC ISO 8601)
+      - '2026-05-18T00:23:12.345+12:00'    (offset ISO 8601)
+    """
+    if not ts:
+        return None
+    s = ts.strip()
+    try:
+        if "T" in s and (s.endswith("Z") or "+" in s[10:] or "-" in s[10:]):
+            iso = s.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(iso)
+            return dt.astimezone(LOCAL_TZ)
+        s = s.replace("T", " ")[:19]
+        dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+        return dt.replace(tzinfo=LOCAL_TZ)
+    except Exception:
+        return None
 
 
 def surfacing_search(query: str, limit: int = 3) -> str:
     """Compact memory surfacing for auto-recall during conversation.
     Target ~400 chars: chunk summaries + top-1 expanded quote + 1 graph link.
 
-    Same-window filter: if the query carries a "[当前对话窗口: window-xxx]"
-    marker (injected by app channel adapters), surfacing skips chunks and
-    conversation messages from that same window — the user already has its
-    context in front of them, surfacing those back is just echo.
+    Same-context filter: when the caller exports IMPRINT_CURRENT_SESSION_ID
+    (e.g. from a UserPromptSubmit hook that has access to the current cc
+    session), surfacing skips anything already visible in cc's prompt
+    context — both content authored in the live session AND content that
+    a forge-reload carried over from a previous session. Detection: read
+    the session's JSONL, take the earliest message timestamp as the
+    context cutoff, drop cc/app messages and chunks dated at-or-after it.
 
-    Also strips channel-adapter prefixes (window marker, timestamp, upload
-    headers, "X 说:" lead-in) before searching so they don't confuse vec/FTS
-    or trick jionlp into pinning the time range to "today".
-    """
+    Other channels (claude.ai sync, telegram, wechat) the cc session can't
+    actually see are NOT filtered — even if their timestamps are recent.
+
+    Adapter-prefix stripping: removes "[当前对话窗口:...]" / timestamp /
+    upload-header / "X 说:" lead-in from the query before searching, so
+    they don't confuse vec/FTS or trick jionlp into time-pinning to today."""
     query = (query or "").strip()
     if not query:
         return ""
@@ -2683,9 +2741,7 @@ def surfacing_search(query: str, limit: int = 3) -> str:
     elif len(query) < 6:
         return ""
 
-    # Identify the current window so we can exclude its own content below.
-    win_m = _WINDOW_MARKER_RE.search(query)
-    current_window = win_m.group(1) if win_m else ""
+    current_session = (os.environ.get("IMPRINT_CURRENT_SESSION_ID") or "").strip()
     # Strip channel-adapter prefixes.
     query = re.sub(r"\[当前对话窗口:[^\]]*\]", "", query)
     query = re.sub(r"\[\d{4}-\d{2}-\d{2}[^\]]*\]", "", query)
@@ -2698,8 +2754,8 @@ def surfacing_search(query: str, limit: int = 3) -> str:
     search_query, after, before = _extract_time_intent(query)
     # When a time range is active, channels apply LIMIT before time filtering,
     # so a small surfacing limit (3) leaves almost nothing after filtering.
-    # Same when window-filtering — we may need to fall back to alternates.
-    if (after or before) or current_window:
+    # Same when context-filtering — we may need alternates to fall back to.
+    if (after or before) or current_session:
         inner_limit = max(limit, 12)
     else:
         inner_limit = limit
@@ -2707,28 +2763,44 @@ def surfacing_search(query: str, limit: int = 3) -> str:
     if not results:
         return ""
 
-    # Same-window filter. Looks at conversation_log content for the literal
-    # window marker. For chunks, peek at any message inside the chunk's range
-    # to see if it carries the current window marker (covers chunks born from
-    # the in-progress conversation).
-    if current_window:
-        marker = f"[当前对话窗口: {current_window}]"
+    # Same-context filter. Combines two signals:
+    #   1) JSONL cutoff — anything dated at-or-after the cc session's earliest
+    #      visible message is in cc's prompt context (live session OR
+    #      forge-reload carry-over). Filter cc/app conv messages and chunks
+    #      whose timestamp crosses the cutoff. Other channels are spared.
+    #   2) session_id fallback — for entries whose timestamp doesn't parse
+    #      cleanly, still catch ones whose session_id literally matches.
+    if current_session:
+        cc_cutoff_dt = _parse_ts(_cc_context_cutoff(current_session))
         db = _get_db()
         try:
             kept = []
             for r in results:
                 pool = r.get("pool")
                 if pool == "conversation":
-                    if marker in (r.get("content", "") or ""):
+                    platform = (r.get("platform") or "")
+                    ts_dt = _parse_ts(r.get("created_at", "") or "")
+                    if cc_cutoff_dt and ts_dt and ts_dt >= cc_cutoff_dt and platform in ("cc", "app"):
                         continue
+                    msg_id = r.get("id")
+                    if msg_id:
+                        row = db.execute(
+                            "SELECT 1 FROM conversation_log WHERE id = ? AND session_id = ? LIMIT 1",
+                            (msg_id, current_session),
+                        ).fetchone()
+                        if row:
+                            continue
                 elif pool == "chunk":
+                    ts_dt = _parse_ts(r.get("start_time", "") or "")
+                    if cc_cutoff_dt and ts_dt and ts_dt >= cc_cutoff_dt:
+                        continue
                     sid = r.get("start_msg_id")
                     eid = r.get("end_msg_id")
                     if sid and eid:
                         row = db.execute(
                             "SELECT 1 FROM conversation_log "
-                            "WHERE id BETWEEN ? AND ? AND content LIKE ? LIMIT 1",
-                            (sid, eid, f"%{marker}%"),
+                            "WHERE id BETWEEN ? AND ? AND session_id = ? LIMIT 1",
+                            (sid, eid, current_session),
                         ).fetchone()
                         if row:
                             continue
