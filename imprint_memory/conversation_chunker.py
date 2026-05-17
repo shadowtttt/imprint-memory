@@ -879,29 +879,63 @@ def update_edges_for_new_chunks(new_chunk_ids: list[int], k: int = TOP_K_NEIGHBO
         db.close()
 
 
+def _find_edge_orphans(db) -> list[int]:
+    """Return chunk ids that have an embedding but no outgoing graph edge.
+
+    Historical situation: chunker used to INSERT a chunk row before
+    confirming the embedding (network blip = NULL embedding stored), and
+    then update_edges_for_new_chunks skipped that chunk because its row
+    didn't show up in the "embedding IS NOT NULL" scan. A later embedding
+    backfill populated the embedding but left the chunk without edges
+    forever — it would silently never appear in any graph-expansion.
+
+    This finds those orphans so the next chunk-update pass can heal them.
+    """
+    try:
+        rows = db.execute(
+            """SELECT c.id FROM conversation_chunks c
+               LEFT JOIN (SELECT DISTINCT source_id FROM chunk_edges) e
+                      ON c.id = e.source_id
+               WHERE e.source_id IS NULL AND c.embedding IS NOT NULL"""
+        ).fetchall()
+        return [r["id"] for r in rows]
+    except Exception:
+        return []
+
+
 def incremental_chunk_update(batch_size: int = 200) -> dict:
     """Run chunk_and_summarize, then update Top-K edges for new chunks.
-    Designed to be called from background tasks (e.g. chat_sync_receiver)."""
+    Designed to be called from background tasks (e.g. chat_sync_receiver).
+
+    Also opportunistically heals "edge orphans" — chunks that have an
+    embedding but no outgoing edges (a side-effect of older runs where
+    embedding was filled in after the chunk row was already created).
+    """
     result = chunk_and_summarize(batch_size=batch_size)
 
-    if not result.get("ok") or result.get("chunks_created", 0) == 0:
-        return result
+    chunks_created = result.get("chunks_created", 0) if result.get("ok") else 0
 
-    # Find the newly created chunk IDs
+    new_ids: list[int] = []
     db = _get_db()
     try:
-        new_chunks = db.execute(
-            """SELECT id FROM conversation_chunks
-               ORDER BY id DESC LIMIT ?""",
-            (result["chunks_created"],),
-        ).fetchall()
-        new_ids = [r["id"] for r in new_chunks]
+        if chunks_created:
+            rows = db.execute(
+                """SELECT id FROM conversation_chunks
+                   ORDER BY id DESC LIMIT ?""",
+                (chunks_created,),
+            ).fetchall()
+            new_ids = [r["id"] for r in rows]
+
+        orphan_ids = _find_edge_orphans(db)
     finally:
         db.close()
 
-    if new_ids:
-        edge_result = update_edges_for_new_chunks(new_ids)
+    to_build = list({*new_ids, *orphan_ids})
+    if to_build:
+        edge_result = update_edges_for_new_chunks(to_build)
         result["edges_created"] = edge_result.get("edges", 0)
+        if orphan_ids:
+            result["edge_orphans_healed"] = len(orphan_ids)
 
     return result
 
