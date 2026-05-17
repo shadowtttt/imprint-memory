@@ -74,6 +74,32 @@ STOPWORD_SKIP_PLATFORMS = {
 _stopword_cache: set[str] | None = None
 _stopword_cache_ts: float = 0
 
+# Day boundary: hour at which the "day" rolls over for time-range search.
+# 0 (default) = midnight. Set to e.g. 9 if the user's day starts at 9am
+# (late-sleeper case: 5am-2pm sleep schedule treats early-morning hours as
+# the previous day). Affects both _ts_to_day() and jionlp range expansion.
+_DAY_BOUNDARY_HOUR = int(os.environ.get("IMPRINT_DAY_BOUNDARY_HOUR", "0"))
+
+
+def _ts_to_day(ts: str) -> str:
+    """Map any stored timestamp to a YYYY-MM-DD day string.
+
+    Handles both 'YYYY-MM-DD HH:MM:SS' (memories/chunks) and ISO 8601 with
+    timezone (conversation_log). When _DAY_BOUNDARY_HOUR > 0, shifts back
+    by that many hours so early-morning timestamps map to the previous day.
+    Returns '' for unparseable input — caller should treat as "unknown date".
+    """
+    if not ts:
+        return ""
+    try:
+        s = ts.replace("T", " ", 1)
+        dt = datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S")
+        if _DAY_BOUNDARY_HOUR:
+            dt = dt - timedelta(hours=_DAY_BOUNDARY_HOUR)
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return ts[:10] if len(ts) >= 10 else ""
+
 
 # ─── Stopwords ──────────────────────────────────────────
 
@@ -2143,20 +2169,31 @@ def unified_search(
             return not any(s <= msg_id <= e for s, e in chunk_ranges)
         results = [r for r in results if _not_covered_by_chunk(r)]
 
-    # Time range: soft boost (in-range results get +0.5), not hard filter
-    if after or before:
+    # Time range filtering:
+    #   - both after & before → precise range (jionlp parsed "yesterday/last week/May 15"):
+    #     hard filter; out-of-range entries are dropped, undated kept.
+    #   - only one side → fuzzy range ("recent/last few days"): soft boost only.
+    # Day comparison goes through _ts_to_day so stored timestamps in different
+    # formats (memories/chunks/conversation_log) all normalise correctly and
+    # the optional day-boundary shift applies.
+    if after and before:
+        kept = []
+        for r in results:
+            day = _ts_to_day(r.get("created_at", "") or r.get("start_time", ""))
+            if not day or after <= day <= before:
+                kept.append(r)
+        results = kept
+    elif after or before:
         _TIME_BOOST = 0.5
         for r in results:
-            ts = r.get("created_at") or r.get("start_time", "")
-            if not ts:
+            day = _ts_to_day(r.get("created_at", "") or r.get("start_time", ""))
+            if not day:
                 continue
-            in_range = True
-            if after and ts < after:
-                in_range = False
-            if before and ts > before:
-                in_range = False
-            if in_range:
-                r["score"] += _TIME_BOOST
+            if after and day < after:
+                continue
+            if before and day > before:
+                continue
+            r["score"] += _TIME_BOOST
         results.sort(key=lambda x: x["score"], reverse=True)
 
     # Filter out PRIVATE-tagged memories
@@ -2234,22 +2271,26 @@ def _extract_time_intent(query: str) -> tuple[str, str | None, str | None]:
             after_date = (today - timedelta(days=days_back)).strftime("%Y-%m-%d")
             return cleaned, after_date, None
 
-    # jionlp: handles 昨天/三周前/4月初/去年冬天/上半年 etc.
+    # jionlp NER: extracts the time expression *and* its surface text, so we
+    # can strip it out of the query before passing to vector/FTS search.
+    # Handles 昨天/三周前/4月初/去年冬天/上半年 etc.
     if _JIO_OK:
         try:
-            result = _jio.parse_time(
+            ents = _jio.ner.extract_time(
                 query,
                 time_base={"year": today.year, "month": today.month, "day": today.day},
             )
-            if result and result.get("time"):
-                t = result["time"]
-                after_date = t[0][:10]
-                before_date = t[1][:10]
-                time_str = result.get("time_string", "")
-                cleaned = query.replace(time_str, "").strip() if time_str else query
-                if not cleaned:
-                    cleaned = query
-                return cleaned, after_date, before_date
+            if ents:
+                ent = ents[0]
+                detail = ent.get("detail") or {}
+                t = detail.get("time")
+                if t and len(t) == 2:
+                    after_date = t[0][:10]
+                    before_date = t[1][:10]
+                    cleaned = query.replace(ent.get("text", ""), "", 1).strip()
+                    if not cleaned:
+                        cleaned = query
+                    return cleaned, after_date, before_date
         except Exception:
             pass
 
@@ -2352,9 +2393,14 @@ def surfacing_search(query: str, limit: int = 3) -> str:
         return ""
 
     search_query, after, before = _extract_time_intent(query)
-    results = unified_search(search_query or query, limit=limit, rerank=False, after=after, before=before)
+    # When a time range is active, channels apply LIMIT before time filtering,
+    # so a small surfacing limit (3) leaves almost nothing after filtering.
+    # Pull a wider candidate pool, then trim back to `limit` after filtering.
+    inner_limit = max(limit, 10) if (after or before) else limit
+    results = unified_search(search_query or query, limit=inner_limit, rerank=False, after=after, before=before)
     if not results:
         return ""
+    results = results[:limit]
 
     lines = []
     locale = os.environ.get("IMPRINT_LOCALE", "en")
