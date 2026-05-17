@@ -2654,9 +2654,22 @@ def unified_search_text(
     return "\n".join(lines)
 
 
+_WINDOW_MARKER_RE = re.compile(r"\[当前对话窗口:\s*([A-Za-z0-9_\-]+)\s*\]")
+
+
 def surfacing_search(query: str, limit: int = 3) -> str:
     """Compact memory surfacing for auto-recall during conversation.
-    Target ~400 chars: chunk summaries + top-1 expanded quote + 1 graph link."""
+    Target ~400 chars: chunk summaries + top-1 expanded quote + 1 graph link.
+
+    Same-window filter: if the query carries a "[当前对话窗口: window-xxx]"
+    marker (injected by app channel adapters), surfacing skips chunks and
+    conversation messages from that same window — the user already has its
+    context in front of them, surfacing those back is just echo.
+
+    Also strips channel-adapter prefixes (window marker, timestamp, upload
+    headers, "X 说:" lead-in) before searching so they don't confuse vec/FTS
+    or trick jionlp into pinning the time range to "today".
+    """
     query = (query or "").strip()
     if not query:
         return ""
@@ -2670,14 +2683,62 @@ def surfacing_search(query: str, limit: int = 3) -> str:
     elif len(query) < 6:
         return ""
 
+    # Identify the current window so we can exclude its own content below.
+    win_m = _WINDOW_MARKER_RE.search(query)
+    current_window = win_m.group(1) if win_m else ""
+    # Strip channel-adapter prefixes.
+    query = re.sub(r"\[当前对话窗口:[^\]]*\]", "", query)
+    query = re.sub(r"\[\d{4}-\d{2}-\d{2}[^\]]*\]", "", query)
+    query = re.sub(r"\[[^\]]*上传了一个文件:[^\]]*\]", "", query)
+    query = re.sub(r"^\s*[\w]+说:\s*", "", query.strip())
+    query = query.strip()
+    if not query:
+        return ""
+
     search_query, after, before = _extract_time_intent(query)
     # When a time range is active, channels apply LIMIT before time filtering,
     # so a small surfacing limit (3) leaves almost nothing after filtering.
-    # Pull a wider candidate pool, then trim back to `limit` after filtering.
-    inner_limit = max(limit, 10) if (after or before) else limit
+    # Same when window-filtering — we may need to fall back to alternates.
+    if (after or before) or current_window:
+        inner_limit = max(limit, 12)
+    else:
+        inner_limit = limit
     results = unified_search(search_query or query, limit=inner_limit, rerank=False, after=after, before=before)
     if not results:
         return ""
+
+    # Same-window filter. Looks at conversation_log content for the literal
+    # window marker. For chunks, peek at any message inside the chunk's range
+    # to see if it carries the current window marker (covers chunks born from
+    # the in-progress conversation).
+    if current_window:
+        marker = f"[当前对话窗口: {current_window}]"
+        db = _get_db()
+        try:
+            kept = []
+            for r in results:
+                pool = r.get("pool")
+                if pool == "conversation":
+                    if marker in (r.get("content", "") or ""):
+                        continue
+                elif pool == "chunk":
+                    sid = r.get("start_msg_id")
+                    eid = r.get("end_msg_id")
+                    if sid and eid:
+                        row = db.execute(
+                            "SELECT 1 FROM conversation_log "
+                            "WHERE id BETWEEN ? AND ? AND content LIKE ? LIMIT 1",
+                            (sid, eid, f"%{marker}%"),
+                        ).fetchone()
+                        if row:
+                            continue
+                kept.append(r)
+            results = kept
+        finally:
+            db.close()
+        if not results:
+            return ""
+
     results = results[:limit]
 
     lines = []
