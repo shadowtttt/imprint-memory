@@ -2003,10 +2003,34 @@ def _search_time_window(query_vec, db, after: str, before: str, limit: int = 20)
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
+# Match channel-agnostic "uploaded a file ... path=..." headers (Chinese
+# channel-adapter convention; harmless no-op for messages without one).
+_IMG_PATH_RE = re.compile(
+    r"上传了一个文件:.*?路径=([^;\]]+?\.(?:jpg|jpeg|png|gif|webp))(?:\s|;|\])",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _extract_image_path(content: str) -> str:
+    """Return the image file path embedded in a channel upload message, or
+    empty string if none. Used to recognise messages that carry an image so
+    chunk expansion can anchor on the "image + surrounding turns" unit."""
+    if not content or "上传了一个文件" not in content:
+        return ""
+    m = _IMG_PATH_RE.search(content)
+    return m.group(1).strip() if m else ""
+
+
 def _expand_chunk_hybrid(query: str, query_vec, results: list[dict], db, max_msgs: int = 5) -> None:
     """Expand chunk results with hybrid keyword + embedding ranked messages.
     Short chunks (<=15 msgs): keyword-only (fast, sufficient).
-    Long chunks: embedding baseline + keyword boost."""
+    Long chunks: embedding baseline + keyword boost.
+
+    Image-anchor rule: when the chunk contains an image-bearing message, pin
+    that message + its immediate neighbour turns into the expansion so the
+    "image + question + reply" unit shows up as one piece. Standalone image
+    messages are useless ("[uploaded a file…]") — they only make sense in
+    context."""
     if _JIEBA_OK:
         from jieba import cut
         query_terms = [w.strip().lower() for w in cut(query) if len(w.strip()) >= 2]
@@ -2028,7 +2052,8 @@ def _expand_chunk_hybrid(query: str, query_vec, results: list[dict], db, max_msg
         msgs = db.execute(
             """SELECT id, direction, speaker, content
                FROM conversation_log
-               WHERE id BETWEEN ? AND ? AND platform NOT IN ('cc')
+               WHERE id BETWEEN ? AND ?
+                 AND (platform NOT IN ('cc') OR content LIKE '%上传了一个文件%')
                ORDER BY id""",
             (sid, eid),
         ).fetchall()
@@ -2072,8 +2097,45 @@ def _expand_chunk_hybrid(query: str, query_vec, results: list[dict], db, max_msg
         if not top:
             top = scored[:max_msgs]
 
+        # Image anchors: find any image-bearing msg inside the chunk and pin
+        # it + its immediate predecessor and successor (as msg ids). Replaces
+        # an equivalent number of low-scoring entries from `top` so the total
+        # expansion size stays roughly bounded.
+        anchor_ids = []
+        for i, m in enumerate(msgs):
+            if _extract_image_path(m["content"] or ""):
+                anchor_ids.append(m["id"])
+                if i > 0:
+                    anchor_ids.append(msgs[i - 1]["id"])
+                if i < len(msgs) - 1:
+                    anchor_ids.append(msgs[i + 1]["id"])
+
+        if anchor_ids:
+            anchor_set = set(anchor_ids)
+            non_anchor_top = [s for s in top if s[1] not in anchor_set]
+            keep_n = max(0, max_msgs - len(anchor_set))
+            non_anchor_top = non_anchor_top[:keep_n]
+            anchor_top = []
+            msg_by_id = {m["id"]: m for m in msgs}
+            for mid in anchor_set:
+                m = msg_by_id.get(mid)
+                if not m:
+                    continue
+                raw = m["content"] or ""
+                clean = _THINK_RE.sub("", raw).strip()
+                speaker = m["speaker"] or (USER_NAME if m["direction"] == "in" else AGENT_NAME)
+                anchor_top.append((0.0, mid, speaker, clean[:300]))
+            top = non_anchor_top + anchor_top
+
         top.sort(key=lambda x: x[1])
-        r["expanded"] = [{"speaker": s, "content": c} for _, _, s, c in top]
+        expanded_items = []
+        for _, mid, speaker, content in top:
+            item = {"speaker": speaker, "content": content}
+            img_path = _extract_image_path(content)
+            if img_path:
+                item["image_path"] = img_path
+            expanded_items.append(item)
+        r["expanded"] = expanded_items
 
 
 # ─── Graph Expansion ───────────────────────────────────
@@ -2301,10 +2363,10 @@ def unified_search(
         })
 
     # Normalise within each pool, scaled by pool confidence.
-    # When a precise time range was pinned, the pool's candidates already passed
-    # a hard time filter — the user vouches for the time window, so don't
-    # penalise low vec_sim within that window (image-bearing/multimodal vectors
-    # naturally score lower than text-on-text).
+    # Time-pinned queries get a chunk-pool boost so the relevant topic segment
+    # surfaces even when its vec_sim is moderate — but conv pool stays on its
+    # normal confidence curve. Image/multimodal messages are meant to appear
+    # *inside* a chunk's expansion, not as standalone hits.
     time_pinned = bool(after and before)
     results: list[dict] = []
     for pool, items in pool_items.items():
@@ -2313,7 +2375,7 @@ def unified_search(
         max_score = max(r["score"] for r in items)
         max_vec = max((r.get("vec_similarity") or 0) for r in items)
         has_fts = any(r.get("rrf_raw", 0) > 0.02 for r in items)
-        if time_pinned:
+        if time_pinned and pool == "chunk":
             pool_conf = 1.0
         elif max_vec >= VEC_CONFIDENCE_GOOD:
             pool_conf = 1.0
@@ -2343,14 +2405,10 @@ def unified_search(
     results = [r for r in results if r["score"] >= floor]
     results.sort(key=lambda x: x["score"], reverse=True)
 
-    # Noise filter: skip when reranker is on (reranker handles relevance).
-    # When a precise time range is pinned, the pool was already narrowed by the
-    # time filter — be much more lenient (×0.15) so multimodal/image-bearing
-    # vectors at lower cosine still survive alongside a high-scoring chunk.
+    # Noise filter: skip when reranker is on (reranker handles relevance)
     if not rerank and results:
         top_score = results[0]["score"]
-        floor_ratio = 0.15 if (after and before) else 0.5
-        noise_floor = top_score * floor_ratio
+        noise_floor = top_score * 0.5
         results = [r for r in results if r["score"] >= noise_floor]
 
     # Dedup: overlapping chunks keep only the higher-scored one
@@ -2367,6 +2425,15 @@ def unified_search(
                 kept_ranges.append((sid, eid))
         deduped.append(r)
     results = deduped
+
+    # Standalone image-upload messages have no value on their own ("[uploaded
+    # a file…]" with no surrounding context). Drop them from final results —
+    # they only make sense as part of a chunk expansion, where image-anchor
+    # logic in _expand_chunk_hybrid surfaces them with neighbour turns.
+    results = [
+        r for r in results
+        if not (r.get("pool") == "conversation" and _extract_image_path(r.get("content", "") or ""))
+    ]
 
     # Dedup: conversation messages covered by a chunk's range → drop
     chunk_ranges = [(ks, ke) for ks, ke in kept_ranges]
@@ -2632,7 +2699,17 @@ def surfacing_search(query: str, limit: int = 3) -> str:
             ts = (r.get("start_time", "") or "")[:10]
             lines.append(f"[{ts}] {summary}")
             expanded = r.get("expanded", [])
-            if expanded:
+            # When the chunk's expansion contains an image-anchored unit, show
+            # that whole unit (image + neighbour turns); otherwise show the
+            # single top expanded message as before.
+            anchor_idx = next((i for i, e in enumerate(expanded) if e.get("image_path")), -1)
+            if anchor_idx >= 0:
+                lo = max(0, anchor_idx - 1)
+                hi = min(len(expanded), anchor_idx + 2)
+                for e in expanded[lo:hi]:
+                    img = f" [📷 {e['image_path']}]" if e.get("image_path") else ""
+                    lines.append(f"  {e['speaker']}: {e['content'][:80]}{img}")
+            elif expanded:
                 lines.append(f"  {expanded[0]['speaker']}: {expanded[0]['content'][:80]}")
 
         elif r["pool"] == "conversation":
