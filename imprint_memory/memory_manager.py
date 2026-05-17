@@ -2010,6 +2010,16 @@ _IMG_PATH_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+# Brackets that channel adapters inject as message prefix metadata. They're
+# useful for routing/marking when the message is in transit, but on the way
+# back out (e.g. in chunk-expansion surfacing) they're noise — they make a
+# historical message look like it's the *current* conversation.
+_ADAPTER_PREFIX_RES = [
+    re.compile(r"\[当前对话窗口:[^\]]*\]"),
+    re.compile(r"\[\d{4}-\d{2}-\d{2}[^\]]*\]"),
+    re.compile(r"\[[^\]]*上传了一个文件:[^\]]*\]"),
+]
+
 
 def _extract_image_path(content: str) -> str:
     """Return the image file path embedded in a channel upload message, or
@@ -2019,6 +2029,19 @@ def _extract_image_path(content: str) -> str:
         return ""
     m = _IMG_PATH_RE.search(content)
     return m.group(1).strip() if m else ""
+
+
+def _clean_msg_for_display(content: str) -> str:
+    """Strip noise from a message before it's shown back to the user in a
+    surfacing snippet: <think> blocks, channel-adapter brackets, and a
+    leading "X 说:" lead-in. Returns the trimmed remainder."""
+    if not content:
+        return ""
+    text = _THINK_RE.sub("", content)
+    for pat in _ADAPTER_PREFIX_RES:
+        text = pat.sub("", text)
+    text = re.sub(r"^\s*[\w]+说:\s*", "", text.strip())
+    return text.strip()
 
 
 def _expand_chunk_hybrid(query: str, query_vec, results: list[dict], db, max_msgs: int = 5) -> None:
@@ -2063,9 +2086,13 @@ def _expand_chunk_hybrid(query: str, query_vec, results: list[dict], db, max_msg
         scored = []
         for m in msgs:
             raw = m["content"] or ""
+            # For scoring keep raw-but-think-stripped (so think text doesn't
+            # leak into keyword match), but the displayed snippet uses the
+            # full cleanup (channel-adapter brackets and 说: prefix removed).
             clean = _THINK_RE.sub("", raw).strip()
             if len(clean) < 5:
                 continue
+            display = _clean_msg_for_display(raw) or clean
 
             # Keyword score
             lower = clean.lower()
@@ -2090,7 +2117,7 @@ def _expand_chunk_hybrid(query: str, query_vec, results: list[dict], db, max_msg
                 score = kw_score
 
             speaker = m["speaker"] or (USER_NAME if m["direction"] == "in" else AGENT_NAME)
-            scored.append((score, m["id"], speaker, clean[:300]))
+            scored.append((score, m["id"], speaker, display[:300]))
 
         scored.sort(key=lambda x: (-x[0], x[1]))
         top = [s for s in scored if s[0] > 0][:max_msgs]
@@ -2122,16 +2149,19 @@ def _expand_chunk_hybrid(query: str, query_vec, results: list[dict], db, max_msg
                 if not m:
                     continue
                 raw = m["content"] or ""
-                clean = _THINK_RE.sub("", raw).strip()
+                img_path = _extract_image_path(raw)
+                display = _clean_msg_for_display(raw) or _THINK_RE.sub("", raw).strip()
                 speaker = m["speaker"] or (USER_NAME if m["direction"] == "in" else AGENT_NAME)
-                anchor_top.append((0.0, mid, speaker, clean[:300]))
-            top = non_anchor_top + anchor_top
+                anchor_top.append((0.0, mid, speaker, display[:300], img_path))
+            top = [(s, i, sp, c, _extract_image_path(msg_by_id.get(i, {}).get("content") or ""))
+                   for (s, i, sp, c) in non_anchor_top] + anchor_top
+        else:
+            top = [(s, i, sp, c, "") for (s, i, sp, c) in top]
 
         top.sort(key=lambda x: x[1])
         expanded_items = []
-        for _, mid, speaker, content in top:
+        for _, mid, speaker, content, img_path in top:
             item = {"speaker": speaker, "content": content}
-            img_path = _extract_image_path(content)
             if img_path:
                 item["image_path"] = img_path
             expanded_items.append(item)
@@ -2846,9 +2876,10 @@ def surfacing_search(query: str, limit: int = 3) -> str:
                 lines.append(f"  {expanded[0]['speaker']}: {expanded[0]['content'][:80]}")
 
         elif r["pool"] == "conversation":
-            content = r.get("content", "")[:60]
+            content = _clean_msg_for_display(r.get("content", "") or "")[:60]
             sp = r.get("speaker") or (USER_NAME if r.get("direction") == "in" else AGENT_NAME)
-            lines.append(f"[{conv_label}] {sp}: {content}")
+            ts = (r.get("created_at", "") or "")[:10]
+            lines.append(f"[{conv_label}|{ts}] {sp}: {content}")
 
     if not lines:
         return ""
