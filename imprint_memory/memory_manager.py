@@ -1753,7 +1753,13 @@ def _search_bank_channels(query, query_vec, db, *, limit=50):
 
 
 def _search_conv_channels(query, query_vec, db, *, platform="", limit=50):
-    """Return (fts_ranking, vec_ranking, like_ranking, details) for conversation pool."""
+    """Return (fts_ranking, vec_ranking, like_ranking, details) for conversation pool.
+
+    The vec channel ranks conversation_vectors globally. Embeddings here may be
+    multimodal (text+image, via Gemini Embedding 2) for messages that uploaded
+    a file, so this channel is what makes "the red screenshot I sent" land on
+    the image-bearing message even when no keyword matches.
+    """
     details = {}
     fts_ranking = []
     vec_ranking = []
@@ -1815,6 +1821,69 @@ def _search_conv_channels(query, query_vec, db, *, platform="", limit=50):
             like_ranking.append((key, idx + 1))
             if key not in details:
                 details[key] = dict(r)
+
+    # ── Vec ranking over conversation_vectors (may be multimodal) ──
+    # Off by default. With many rows the matmul is cheap (~50ms via numpy) but
+    # the SQL load is non-trivial and, more importantly, current embeddings
+    # may have been generated without Gemini's task_type=RETRIEVAL_QUERY/
+    # DOCUMENT so query↔document cosines don't align — short text messages
+    # dominate the top ranks. Re-enable via IMPRINT_CONV_VEC_CHANNEL=1 once
+    # vectors are rebuilt with proper task types.
+    if query_vec and os.environ.get("IMPRINT_CONV_VEC_CHANNEL", "0") == "1":
+        try:
+            import numpy as _np
+            if platform:
+                v_rows = db.execute(
+                    """SELECT c.id, c.platform, c.direction, c.speaker, c.content,
+                              c.created_at, v.embedding
+                       FROM conversation_log c
+                       JOIN conversation_vectors v ON v.msg_id = c.id
+                       WHERE v.embedding IS NOT NULL AND c.platform = ?""",
+                    (platform,),
+                ).fetchall()
+            else:
+                v_rows = db.execute(
+                    """SELECT c.id, c.platform, c.direction, c.speaker, c.content,
+                              c.created_at, v.embedding
+                       FROM conversation_log c
+                       JOIN conversation_vectors v ON v.msg_id = c.id
+                       WHERE v.embedding IS NOT NULL"""
+                ).fetchall()
+            if v_rows:
+                dim = len(query_vec)
+                mat = _np.empty((len(v_rows), dim), dtype=_np.float32)
+                valid = _np.ones(len(v_rows), dtype=bool)
+                for i, r in enumerate(v_rows):
+                    blob = r["embedding"]
+                    if not blob or len(blob) // 4 != dim:
+                        valid[i] = False
+                        continue
+                    mat[i] = _np.frombuffer(blob, dtype=_np.float32)
+                q = _np.asarray(query_vec, dtype=_np.float32)
+                row_norms = _np.linalg.norm(mat, axis=1)
+                q_norm = float(_np.linalg.norm(q)) or 1.0
+                sims = (mat @ q) / (row_norms * q_norm + 1e-8)
+                sims[~valid] = -1.0
+                sims[~_np.isfinite(sims)] = -1.0
+                eligible = _np.where(sims >= VEC_PRE_FILTER)[0]
+                if eligible.size:
+                    order = eligible[_np.argsort(-sims[eligible])][:limit]
+                    for idx, pos in enumerate(order):
+                        r = v_rows[int(pos)]
+                        key = f"conv_{r['id']}"
+                        vec_ranking.append((key, idx + 1))
+                        sim_val = float(sims[int(pos)])
+                        if key not in details:
+                            details[key] = dict(r)
+                        details[key]["vec_similarity"] = max(
+                            details[key].get("vec_similarity", 0) or 0,
+                            sim_val,
+                        )
+                        details[key].pop("embedding", None)
+        except ImportError:
+            pass
+        except Exception:
+            pass
 
     return fts_ranking, vec_ranking, like_ranking, details
 
@@ -2232,6 +2301,11 @@ def unified_search(
         })
 
     # Normalise within each pool, scaled by pool confidence.
+    # When a precise time range was pinned, the pool's candidates already passed
+    # a hard time filter — the user vouches for the time window, so don't
+    # penalise low vec_sim within that window (image-bearing/multimodal vectors
+    # naturally score lower than text-on-text).
+    time_pinned = bool(after and before)
     results: list[dict] = []
     for pool, items in pool_items.items():
         if not items:
@@ -2239,7 +2313,9 @@ def unified_search(
         max_score = max(r["score"] for r in items)
         max_vec = max((r.get("vec_similarity") or 0) for r in items)
         has_fts = any(r.get("rrf_raw", 0) > 0.02 for r in items)
-        if max_vec >= VEC_CONFIDENCE_GOOD:
+        if time_pinned:
+            pool_conf = 1.0
+        elif max_vec >= VEC_CONFIDENCE_GOOD:
             pool_conf = 1.0
         elif has_fts:
             pool_conf = max(0.6, 0.15 + 0.85 * max(0, (max_vec - VEC_CONFIDENCE_NOISE)) / (VEC_CONFIDENCE_GOOD - VEC_CONFIDENCE_NOISE))
@@ -2267,10 +2343,14 @@ def unified_search(
     results = [r for r in results if r["score"] >= floor]
     results.sort(key=lambda x: x["score"], reverse=True)
 
-    # Noise filter: skip when reranker is on (reranker handles relevance)
+    # Noise filter: skip when reranker is on (reranker handles relevance).
+    # When a precise time range is pinned, the pool was already narrowed by the
+    # time filter — be much more lenient (×0.15) so multimodal/image-bearing
+    # vectors at lower cosine still survive alongside a high-scoring chunk.
     if not rerank and results:
         top_score = results[0]["score"]
-        noise_floor = top_score * 0.5
+        floor_ratio = 0.15 if (after and before) else 0.5
+        noise_floor = top_score * floor_ratio
         results = [r for r in results if r["score"] >= noise_floor]
 
     # Dedup: overlapping chunks keep only the higher-scored one
