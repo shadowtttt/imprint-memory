@@ -2916,7 +2916,30 @@ def surfacing_search(query: str, limit: int = 3) -> str:
         if not results:
             return ""
 
-    results = results[:limit]
+    # Pool-diversity guarantee: chunks are at a length disadvantage vs
+    # conv-message hits (a 200-char summary vs a 30-char raw line means the
+    # raw line wins on cosine even when both are about the same event), so
+    # straight global sort tends to crowd chunks out. But chunks carry the
+    # topic summary + expansion of representative messages — they're what
+    # makes a surfacing line *legible*. If no chunk made it into the limit
+    # naturally, swap in the best chunk from the remainder, replacing the
+    # lowest-scoring non-chunk in the kept set. Re-sort by score so the
+    # output still reads "best on top".
+    top = results[:limit]
+    if not any(r.get("pool") == "chunk" for r in top):
+        fallback_chunk = next(
+            (r for r in results[limit:]
+             if r.get("pool") == "chunk" and r.get("score", 0) > 0),
+            None,
+        )
+        if fallback_chunk:
+            non_chunk = [r for r in top if r.get("pool") != "chunk"]
+            if non_chunk:
+                to_drop = min(non_chunk, key=lambda r: r.get("score", 0))
+                top = [r for r in top if r is not to_drop]
+                top.append(fallback_chunk)
+                top.sort(key=lambda r: r.get("score", 0), reverse=True)
+    results = top
 
     lines = []
     locale = os.environ.get("IMPRINT_LOCALE", "en")
