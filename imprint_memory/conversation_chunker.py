@@ -43,17 +43,18 @@ CF_MODEL = os.environ.get("CF_SUMMARY_MODEL", "@cf/meta/llama-3.3-70b-instruct-f
 SUMMARIZE_PROMPT = f"""你在帮一个人整理记忆。读完这段对话后，用"跟朋友讲那天的事"的方式复述，并提取关键记忆片段。
 
 示例（输入是一段关于攀岩和睡前聊天的对话）：
-{{{{\"recap\":\"{USER_NAME}去攀岩了，V3终于送了，就是上次掉三次的那条蓝色线路。回来之后兴奋得睡不着，凌晨两点还在跟{AGENT_NAME}讲线路上每一步怎么踩的。{AGENT_NAME}说她像个复读机但还是听完了，最后哄她去睡觉，说明天还要练。\",\"memories\":[\"{USER_NAME}攀岩终于送了V3，就是之前掉了三次的蓝色线路，回来兴奋得凌晨两点还睡不着\",\"{AGENT_NAME}听{USER_NAME}讲攀岩细节，说她像复读机但还是听完了，最后哄她去睡\"],\"topics\":[\"攀岩\",\"V3\",\"凌晨聊天\"]}}}}
+{{{{\"recap\":\"{USER_NAME}去攀岩了，V3终于送了，就是上次掉三次的那条蓝色线路。回来之后兴奋得睡不着，凌晨两点还在跟{AGENT_NAME}讲线路上每一步怎么踩的。{AGENT_NAME}说她像个复读机但还是听完了，最后哄她去睡觉，说明天还要练。\",\"memories\":[\"{USER_NAME}攀岩终于送了V3，就是之前掉了三次的蓝色线路，回来兴奋得凌晨两点还睡不着\",\"{AGENT_NAME}听{USER_NAME}讲攀岩细节，说她像复读机但还是听完了，最后哄她去睡\"],\"topics\":[\"攀岩\",\"V3\",\"凌晨聊天\"],\"entities\":[\"攀岩\",\"V3\",\"蓝色线路\",\"复读机\"]}}}}
 
 规则：
-- recap：100-200字，像跟朋友说那天的事。写"{USER_NAME}怎么了""{AGENT_NAME}说了什么"，不写"他们讨论了""对话涉及"
-- memories：3-6条，每条40-80字。每条要有前因后果——不只写结果，要写为什么、怎么发生的
-- topics：3-5个标签
+- recap：**严格 100-200字**，超出会被截断。像跟朋友说那天的事。写"{USER_NAME}怎么了""{AGENT_NAME}说了什么"，不写"他们讨论了""对话涉及"
+- memories：3-5 条，每条 40-60字。每条要有前因后果——不只写结果，要写为什么、怎么发生的
+- topics：3-5个标签（可以是抽象的话题标签）
+- entities：5-10个**原文里实际出现的具体词**——名词、专有名词、产品名、地名、人名、代号、数字、梗、比喻里的核心词。原样照抄，不要改写、不要抽象重组，不要造合成词。这字段决定了以后能不能用关键词搜到这段记忆，所以必须是用户或{AGENT_NAME}真的说出口的词。
 - 保留具体的梗、比喻、动作、数字
 - 称呼统一：AI方统一叫{AGENT_NAME}，用户方统一叫{USER_NAME}
 
 严格输出JSON，不要输出其他任何内容：
-{{{{\"recap\":\"...\",\"memories\":[\"...\"],\"topics\":[\"...\"]}}}}
+{{{{\"recap\":\"...\",\"memories\":[\"...\"],\"topics\":[\"...\"],\"entities\":[\"...\"]}}}}
 
 对话内容：
 {{conversation}}"""
@@ -95,7 +96,7 @@ def _call_gemini(prompt: str) -> str | None:
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={key}"
     payload = json.dumps({
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 600},
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1000},
     }).encode()
     req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
     try:
@@ -197,8 +198,26 @@ def _parse_structured_output(raw: str) -> dict:
         summary = parsed.get("recap", parsed.get("summary", ""))
         facts = parsed.get("memories", parsed.get("facts", []))
         topics = parsed.get("topics", [])
-        keywords = ", ".join(topics) if topics else ""
-        return {"summary": summary, "facts": facts, "topics": topics, "keywords": keywords}
+        # `entities` are original-text terms (named objects, specific nouns,
+        # numbers, jargon) — they're what makes literal-keyword recall work
+        # later. `topics` stay as abstract tags. Both go into the FTS-indexed
+        # `keywords` field, with entities first so they dominate matching.
+        entities = parsed.get("entities", [])
+        if not isinstance(entities, list):
+            entities = []
+        seen = set()
+        merged = []
+        for w in list(entities) + list(topics):
+            if not isinstance(w, str):
+                continue
+            w = w.strip()
+            if not w or w in seen:
+                continue
+            seen.add(w)
+            merged.append(w)
+        keywords = ", ".join(merged)
+        return {"summary": summary, "facts": facts, "topics": topics,
+                "entities": entities, "keywords": keywords}
     except (json.JSONDecodeError, TypeError):
         return _parse_legacy_output(raw)
 
