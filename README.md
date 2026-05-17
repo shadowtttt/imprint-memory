@@ -1,5 +1,5 @@
 <p align="center">
-  <strong>English</strong> | <a href="#中文">中文</a>
+  <strong>English</strong> | <a href="#zh">中文</a>
 </p>
 
 # imprint-memory
@@ -226,7 +226,7 @@ MIT
 
 ---
 
-<a id="���文"></a>
+<a id="zh"></a>
 
 <p align="center">
   <a href="#imprint-memory">English</a> | <strong>中文</strong>
