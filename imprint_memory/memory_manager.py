@@ -1215,6 +1215,7 @@ RERANK_BLEND = 0.3      # How much rerank factors affect final score
 LIKE_LIMIT = 50         # Max results from LIKE exact-match channel per pool
 VEC_CONFIDENCE_NOISE = 0.40   # vec_sim below this → pool is noise
 VEC_CONFIDENCE_GOOD = 0.55    # vec_sim above this → pool is clearly relevant
+MMR_SIM_THRESHOLD = 0.78      # chunk-pair cosine ≥ this counts as "same topic" for MMR dedup
 
 
 def _days_since(time_str: str, default: float = 30.0) -> float:
@@ -1888,6 +1889,70 @@ def _search_conv_channels(query, query_vec, db, *, platform="", limit=50):
     return fts_ranking, vec_ranking, like_ranking, details
 
 
+def _mmr_diversify(results: list[dict], db, limit_pool: int = 20,
+                   sim_threshold: float = 0.78) -> list[dict]:
+    """Greedy MMR pass over chunk results to break "echo amplification".
+
+    When the same topic gets discussed repeatedly, each discussion becomes
+    its own near-duplicate chunk, and the top-K starts crowding with copies
+    of that one topic — pushing genuinely different related events out.
+
+    For each candidate, walk in current score order. Compare against each
+    already-kept chunk by cosine over their stored chunk embeddings; if
+    any pair scores at or above sim_threshold, the candidate is "too
+    similar" and gets shelved. If we run out of fresh candidates before
+    reaching the caller's limit, the shelved ones fill the remaining
+    slots so we never return fewer results than the unfiltered version.
+
+    Only operates on the chunk pool. Memory / conversation rows pass
+    through untouched (their dedup is handled elsewhere).
+    """
+    candidates = results[:limit_pool]
+    tail = results[limit_pool:]
+
+    chunk_ids = [r["id"] for r in candidates if r.get("pool") == "chunk" and r.get("id")]
+    embeddings: dict[int, list[float]] = {}
+    if chunk_ids:
+        placeholders = ",".join("?" * len(chunk_ids))
+        try:
+            rows = db.execute(
+                f"SELECT id, embedding FROM conversation_chunks "
+                f"WHERE id IN ({placeholders})",
+                chunk_ids,
+            ).fetchall()
+            for row in rows:
+                blob = row["embedding"]
+                if blob:
+                    embeddings[row["id"]] = _blob_to_vec(blob)
+        except Exception:
+            embeddings = {}
+
+    kept: list[dict] = []
+    shelved: list[dict] = []
+    kept_chunk_vecs: list[list[float]] = []
+
+    for r in candidates:
+        if r.get("pool") != "chunk":
+            kept.append(r)
+            continue
+        cid = r.get("id")
+        cvec = embeddings.get(cid) if cid else None
+        too_similar = False
+        if cvec and kept_chunk_vecs:
+            for kvec in kept_chunk_vecs:
+                if _cosine_similarity(cvec, kvec) >= sim_threshold:
+                    too_similar = True
+                    break
+        if too_similar:
+            shelved.append(r)
+        else:
+            kept.append(r)
+            if cvec:
+                kept_chunk_vecs.append(cvec)
+
+    return kept + shelved + tail
+
+
 def _search_time_window(query_vec, db, after: str, before: str, limit: int = 20):
     """In-range vec recall channel.
 
@@ -2510,6 +2575,16 @@ def unified_search(
     # LLM rerank: take top-20 candidates, ask LLM to score relevance
     if rerank and len(results) > 3:
         results = _llm_rerank(query, results[:20])
+
+    # MMR diversification: prevent "echo amplification" where repeatedly
+    # discussing event A produces many near-duplicate chunks that crowd the
+    # top, pushing related-but-different events C/D out. Greedy: walk in
+    # score order, skip a candidate if any already-kept chunk is too similar
+    # to it (cosine >= MMR_SIM_THRESHOLD). Non-chunk results pass through
+    # untouched. If everything is similar, falls back to taking by score.
+    if len(results) > limit:
+        results = _mmr_diversify(results, db, limit_pool=max(limit * 4, 20),
+                                  sim_threshold=MMR_SIM_THRESHOLD)
 
     results = results[:limit]
 
