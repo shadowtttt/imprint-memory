@@ -3,8 +3,56 @@ Conversation log — Layer 3 of the memory architecture.
 Stores full conversation history from all platforms with FTS5 search.
 """
 
+import re
+import struct
+from pathlib import Path
+
 from .db import _get_db, now_str, LOCAL_TZ, segment_cjk, sanitize_fts_query
 from datetime import datetime
+
+
+# Match a channel-adapter-injected upload header. Looking for the Chinese
+# convention used across our channels: "上传了一个文件: 文件名=...; MIME=...;
+# 路径=/abs/path.ext". Other adapters can adopt the same shape to get
+# automatic multimodal indexing.
+_UPLOAD_PATH_RE = re.compile(
+    r"上传了一个文件:.*?路径=([^;\]]+?\.(?:jpg|jpeg|png|gif|webp))(?:\s|;|\])",
+    re.IGNORECASE | re.DOTALL,
+)
+_IMG_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+
+
+def _maybe_embed_image(msg_id: int, content: str, db) -> None:
+    """If the just-logged message announces a file upload with a real image
+    path, run a multimodal embed (text + image) and store it in
+    conversation_vectors. Best-effort: any failure is swallowed so logging
+    stays robust; the periodic backfill job will catch missed ones.
+    """
+    if not content or "上传了一个文件" not in content:
+        return
+    m = _UPLOAD_PATH_RE.search(content)
+    if not m:
+        return
+    path_str = m.group(1).strip()
+    p = Path(path_str)
+    if not p.exists() or p.suffix.lower() not in _IMG_EXTS:
+        return
+    try:
+        # Late import to avoid a circular dependency at module load time.
+        from .memory_manager import _embed, EMBED_MODEL
+        vec = _embed(content, image_path=str(p))
+        if not vec:
+            return
+        blob = struct.pack(f"{len(vec)}f", *vec)
+        db.execute(
+            "INSERT OR REPLACE INTO conversation_vectors (msg_id, embedding, model) "
+            "VALUES (?, ?, ?)",
+            (msg_id, blob, EMBED_MODEL),
+        )
+        db.commit()
+    except Exception:
+        # Silent failure on purpose — backfill job is the safety net.
+        pass
 
 
 def log_message(
@@ -70,7 +118,9 @@ def log_message(
             ),
         )
         db.commit()
-        return {"ok": True, "id": cur.lastrowid}
+        msg_id = cur.lastrowid
+        _maybe_embed_image(msg_id, clean_content, db)
+        return {"ok": True, "id": msg_id}
     finally:
         db.close()
 

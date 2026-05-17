@@ -8,6 +8,7 @@ import json
 import os
 import re
 import struct
+import time
 import urllib.request
 from datetime import datetime
 
@@ -441,10 +442,23 @@ def chunk_and_summarize(batch_size: int = 200, dry_run: bool = False) -> dict:
             keywords = parsed["keywords"]
             facts = parsed["facts"]
 
-            embedding = _embed(summary)
-            embedding_blob = (
-                struct.pack(f"{len(embedding)}f", *embedding) if embedding else None
-            )
+            # Embed with retries — transient API failures (rate limit, blip)
+            # used to leave the chunk in the table with NULL embedding, which
+            # made the chunk silently unsearchable until a backfill job ran.
+            # We'd rather skip the insert entirely than ship a half-baked row.
+            embedding = None
+            for attempt in range(3):
+                embedding = _embed(summary)
+                if embedding:
+                    break
+                if attempt < 2:
+                    time.sleep(1.5 * (attempt + 1))
+            if not embedding:
+                print(f"Skip chunk {chunk_msgs[0]['id']}-{chunk_msgs[-1]['id']}: "
+                      f"embedding failed after 3 attempts")
+                skipped += 1
+                continue
+            embedding_blob = struct.pack(f"{len(embedding)}f", *embedding)
 
             platforms = ",".join(sorted(set(m["platform"] for m in chunk_msgs)))
 
