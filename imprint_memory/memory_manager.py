@@ -2252,6 +2252,45 @@ def _expand_chunk_hybrid(query: str, query_vec, results: list[dict], db, max_msg
         else:
             top = [(s, i, sp, c, "") for (s, i, sp, c) in top]
 
+        # Pair each ranked message with the opposite-direction neighbour
+        # so the expansion never shows one side of a turn in isolation.
+        # 'in' msg → attach the next 'out' that follows it inside the chunk.
+        # 'out' msg → attach the most recent 'in' that came before it.
+        msg_by_id = {m["id"]: m for m in msgs}
+        msg_idx_by_id = {m["id"]: i for i, m in enumerate(msgs)}
+        chosen_ids = {t[1] for t in top}
+        pair_entries = []
+        for t in top:
+            mid = t[1]
+            if mid not in msg_idx_by_id:
+                continue
+            idx = msg_idx_by_id[mid]
+            cur_dir = msgs[idx]["direction"]
+            target = "out" if cur_dir == "in" else "in"
+            pair_msg = None
+            if target == "out":
+                for j in range(idx + 1, len(msgs)):
+                    if msgs[j]["direction"] == "out":
+                        pair_msg = msgs[j]
+                        break
+            else:
+                for j in range(idx - 1, -1, -1):
+                    if msgs[j]["direction"] == "in":
+                        pair_msg = msgs[j]
+                        break
+            if pair_msg is None or pair_msg["id"] in chosen_ids:
+                continue
+            raw = pair_msg["content"] or ""
+            clean = _THINK_RE.sub("", raw).strip()
+            if len(clean) < 5:
+                continue
+            display = _clean_msg_for_display(raw) or clean
+            sp = pair_msg["speaker"] or (USER_NAME if pair_msg["direction"] == "in" else AGENT_NAME)
+            img = _extract_image_path(raw)
+            pair_entries.append((0.0, pair_msg["id"], sp, display[:300], img))
+            chosen_ids.add(pair_msg["id"])
+        top.extend(pair_entries)
+
         top.sort(key=lambda x: x[1])
         expanded_items = []
         for _, mid, speaker, content, img_path in top:
@@ -2832,17 +2871,22 @@ def unified_search_text(
         elif r["pool"] == "chunk":
             # Chunk acts as a navigation index — surface the raw originals
             # the chunk points to, not the chunk's own summary. Each
-            # expanded message lands on its own labeled line so the user
+            # expanded message lands on its own labeled line so the caller
             # sees real chat, while the chunk-level FTS / vec match
             # provided the recall power. Dedup by (speaker, content): the
-            # same message repeated by the user (e.g. "@gemini …" tapped
-            # four times) should appear once, not flood the result page.
+            # same message repeated (e.g. "@gemini …" tapped four times)
+            # should appear once, not flood the result page.
             for em in r.get("expanded", []):
                 raw = em.get("content", "") or ""
                 em_text = _clean_msg_for_display(raw)
                 if len(em_text) < 5:
                     continue
                 em_sp = em.get("speaker") or ""
+                # Collapse embedded newlines + runs of whitespace so each
+                # snippet renders on a single line — multi-line raw
+                # messages otherwise punched 10+ empty lines between
+                # paragraphs into the result block.
+                em_text = " ".join(em_text.split())
                 sig = (em_sp, em_text)
                 if sig in seen_em_sigs:
                     continue
