@@ -2971,7 +2971,12 @@ def surfacing_search(query: str, limit: int = 3) -> str:
                     img = f" [📷 {e['image_path']}]" if e.get("image_path") else ""
                     lines.append(f"  {e['speaker']}: {e['content'][:150]}{img}")
             elif expanded:
-                lines.append(f"  {expanded[0]['speaker']}: {expanded[0]['content'][:150]}")
+                # Show top 3 expanded messages (already ranked by hybrid keyword
+                # + per-message embedding inside _expand_chunk_hybrid). Earlier
+                # this used expanded[0] only and wasted the ranking work.
+                for e in expanded[:3]:
+                    img = f" [📷 {e['image_path']}]" if e.get("image_path") else ""
+                    lines.append(f"  {e['speaker']}: {e['content'][:150]}{img}")
 
         elif r["pool"] == "conversation":
             content = _clean_msg_for_display(r.get("content", "") or "")[:150]
@@ -2982,7 +2987,7 @@ def surfacing_search(query: str, limit: int = 3) -> str:
     if not lines:
         return ""
 
-    graph = _graph_expansion_section(query, results, limit=1)
+    graph = _graph_expansion_section(query, results, limit=2)
     if graph:
         lines.append(f"— {graph[0]}")
 
@@ -3050,7 +3055,12 @@ def _graph_expansion_section(query: str, rrf_results: list[dict], limit: int = 5
                 n_kws = {k.strip().lower() for k in (n["keywords"] or "").split(",") if k.strip()}
                 if seed_keywords and n_kws:
                     overlap = len(n_kws & seed_keywords) / max(len(n_kws), 1)
-                    if overlap > 0.3:
+                    # Only skip near-duplicate neighbours. Older threshold (0.3)
+                    # treated "same broad topic" as duplicate, so when a topic
+                    # was discussed across many chunks the entire graph layer
+                    # got filtered to empty. 0.7 keeps only chunks that share
+                    # almost all of their keywords (true repeat events).
+                    if overlap > 0.7:
                         continue
 
                 seen_ids.add(n["target_id"])
