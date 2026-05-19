@@ -220,6 +220,15 @@ pip install -e '.[all]'
 pytest
 ```
 
+## Acknowledgements
+
+Built on top of these open-source libraries:
+
+- **[JioNLP](https://github.com/dongrixinyu/JioNLP)** by *dongrixinyu* (Apache 2.0) — powers the natural-language time parsing in `_extract_time_intent` (`昨天`/`上周`/`5月15日` → date ranges via `jionlp.ner.extract_time`). Without it, queries like "what we talked about yesterday" couldn't pin a real time window.
+- **[jieba](https://github.com/fxsjy/jieba)** (MIT) — Chinese tokenisation for FTS5 indexing and keyword extraction.
+- **[NumPy](https://numpy.org/)** (BSD) — vector-space matrix operations for the graph build (Top-K edges, MMR diversification).
+- **Embedding providers**: Google Gemini Embedding 2 (multimodal), OpenAI `text-embedding-3-small`, or local Ollama `bge-m3` — configured via `EMBED_PROVIDER`.
+
 ## License
 
 MIT
@@ -418,6 +427,15 @@ cd imprint-memory
 pip install -e '.[all]'
 pytest
 ```
+
+## 致谢
+
+记忆系统建立在这些开源项目之上：
+
+- **[JioNLP](https://github.com/dongrixinyu/JioNLP)** by *dongrixinyu* (Apache 2.0) — 提供自然语言时间解析（`_extract_time_intent`），让"昨天/上周/5 月 15 日"能转成具体日期范围。没有它，"昨天我们聊了什么"这种 query 锚不到真正的时间窗。
+- **[jieba](https://github.com/fxsjy/jieba)** (MIT) — 中文分词，用于 FTS5 索引和关键词提取。
+- **[NumPy](https://numpy.org/)** (BSD) — 图谱构建（Top-K 边、MMR 去重）的矩阵运算。
+- **Embedding 提供方**：Google Gemini Embedding 2（多模态）、OpenAI `text-embedding-3-small`、或本地 Ollama `bge-m3` —— 通过 `EMBED_PROVIDER` 配置。
 
 ## 许可证
 
