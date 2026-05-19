@@ -2998,16 +2998,18 @@ def surfacing_search(query: str, limit: int = 3) -> str:
         inner_limit = max(limit, 12)
     else:
         inner_limit = limit
-    # Surfacing wants chunk summaries (legibility) + raw originals + memories
-    # + bank, all four pools. Manual search (memory_search MCP tool) uses the
-    # default 3-pool set without chunks.
+    # Same chunk-as-navigator logic as manual search: pull memory + bank +
+    # chunk. Surfacing's renderer keeps the chunk summary visible (the
+    # one-line recap helps the agent skim what each match is about) and
+    # then lists the chunk's top expanded messages as 原文截取 — manual
+    # search hides the summary and shows only originals.
     results = unified_search(
         search_query or query,
         limit=inner_limit,
         rerank=False,
         after=after,
         before=before,
-        pools=["memory", "bank", "conversation", "chunk"],
+        pools=["memory", "bank", "chunk"],
     )
     if not results:
         return ""
