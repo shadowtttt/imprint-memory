@@ -2766,6 +2766,12 @@ def _cc_context_cutoff(session_id: str) -> str:
     the live session, or carried over by a forge-reload), so surfacing
     it back is echo.
 
+    Scans past metadata-only entries (e.g. {"type":"ai-title"} headers cc
+    writes at the top of fresh sessions) until it finds the first entry
+    that actually carries a `timestamp` field — that's the earliest real
+    message and the true cutoff. Hard-limited to the first ~50 lines so a
+    pathologically meta-heavy JSONL doesn't open the whole file.
+
     Returns "" when the session id can't be resolved to a JSONL file.
     """
     if not session_id:
@@ -2778,13 +2784,19 @@ def _cc_context_cutoff(session_id: str) -> str:
         for jsonl in projects_dir.rglob(f"{session_id}.jsonl"):
             try:
                 with jsonl.open(encoding="utf-8") as f:
-                    first_line = f.readline().strip()
-                if not first_line:
-                    continue
-                obj = _json.loads(first_line)
-                ts = obj.get("timestamp") or ""
-                if ts:
-                    return ts
+                    for i, line in enumerate(f):
+                        if i >= 50:
+                            break
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = _json.loads(line)
+                        except Exception:
+                            continue
+                        ts = obj.get("timestamp") or ""
+                        if ts:
+                            return ts
             except Exception:
                 continue
     except Exception:
