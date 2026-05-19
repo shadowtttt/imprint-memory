@@ -1264,10 +1264,18 @@ def _sanitize_fts(query: str) -> str:
     cleaned = " ".join(cleaned.split()).strip()
     if not cleaned:
         return cleaned
+    # Tokenize first, drop stopwords, THEN OR-join. Doing it the other way
+    # around (OR-join → filter_stopwords) leaves dangling OR operators
+    # between dropped terms — FTS5 rejects "上次 OR OR OR p5js" as a syntax
+    # error and the whole query silently returns nothing.
     segmented = _fts_query_cjk(cleaned)
-    terms = segmented.split()
+    terms = [t for t in segmented.split() if t != "OR"]
     filtered = filter_stopwords(terms)
-    return " ".join(filtered)
+    if not filtered:
+        return ""
+    if len(filtered) == 1:
+        return filtered[0]
+    return " OR ".join(filtered)
 
 
 # ─── Chunk + Graph Search Channel ────────────────────────
