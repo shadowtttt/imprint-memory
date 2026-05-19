@@ -60,9 +60,9 @@ EMBED_MODEL = os.environ.get("EMBED_MODEL", _DEFAULT_MODELS.get(EMBED_PROVIDER, 
 BANK_INDEX_VERSION = 2
 
 # Hybrid search weights
-WEIGHT_VECTOR = 0.4
-WEIGHT_FTS = 0.4
-WEIGHT_RECENCY = 0.2
+WEIGHT_VECTOR = 0.5
+WEIGHT_FTS = 0.5
+WEIGHT_RECENCY = 0.0  # time decay disabled — old hits rank by relevance, not age
 
 # Stopwords config
 STOPWORD_THRESHOLD = float(os.environ.get("STOPWORD_THRESHOLD", "0.15"))
@@ -1581,17 +1581,14 @@ def _inject_default_ranks(
 # ─── Rerank Functions ───────────────────────────────────
 
 def _rerank_memory(rrf_score: float, row: dict) -> float:
-    """Memory rerank: time x activation x importance x specificity, blended with RRF."""
+    """Memory rerank: activation x importance x specificity, blended with RRF.
+    Time decay is disabled — a 3-month-old memory that matches the query
+    well shouldn't lose to a recent irrelevant hit just because it's old."""
     if row.get("pinned"):
         return rrf_score
 
     importance = max(row.get("importance", 5), 1)
     recalled = row.get("recalled_count", 0)
-
-    ref = row.get("last_accessed_at") or row.get("created_at", "")
-    days = _days_since(ref, default=30)
-    lam = 0.05 / (importance / 5)
-    time_factor = 0.4 + 0.6 * math.exp(-lam * days)
 
     activation_factor = 0.8 + 0.2 * (math.log(recalled + 1) / math.log(51))
     importance_factor = 0.7 + 0.3 * (importance / 10)
@@ -1599,30 +1596,20 @@ def _rerank_memory(rrf_score: float, row: dict) -> float:
     content_len = len(row.get("content", ""))
     specificity = min(1.0, 0.5 + 0.5 * (content_len / 40)) if content_len < 40 else 1.0
 
-    factor = time_factor * activation_factor * importance_factor * specificity
+    factor = activation_factor * importance_factor * specificity
     return rrf_score * (1 - RERANK_BLEND + RERANK_BLEND * factor)
 
 
 def _rerank_bank(rrf_score: float, row: dict) -> float:
-    """Bank rerank: gentle file freshness (tiebreaker only)."""
-    mtime = row.get("file_mtime")
-    if mtime is not None:
-        try:
-            dt = datetime.fromtimestamp(float(mtime), tz=LOCAL_TZ)
-            days = max(0.0, (now_local() - dt).total_seconds() / 86400)
-        except (ValueError, TypeError, OSError):
-            days = 7.0
-    else:
-        days = 7.0
-    freshness = 0.90 + 0.10 * math.exp(-days / 90)
-    return rrf_score * (1 - RERANK_BLEND + RERANK_BLEND * freshness)
+    """Bank rerank: time decay disabled, pass RRF through."""
+    return rrf_score
 
 
 def _rerank_conv(rrf_score: float, row: dict) -> float:
-    """Conversation/chunk rerank: recency (7-day half-life)."""
-    days = _days_since(row.get("created_at") or row.get("start_time", ""), default=30)
-    recency = 0.3 + 0.7 * math.exp(-days / 7)
-    return rrf_score * (1 - RERANK_BLEND + RERANK_BLEND * recency)
+    """Conversation/chunk rerank: time decay disabled, pass RRF through.
+    Previously 7-day half-life crushed any chat older than two weeks; users
+    searching for specific old conversations couldn't find them."""
+    return rrf_score
 
 
 # ─── Per-Pool Channel Search ────────────────────────────
@@ -2362,6 +2349,12 @@ def unified_search(
         pool, score, rrf_raw, id, content, + pool-specific fields
     """
     if pools is None:
+        # Default: search the three "primary" pools that hold authoritative
+        # content — memory (curated facts), bank (markdown notes),
+        # conversation (raw chat log). Chunk summaries are an indexing
+        # convenience for surfacing, not a search target by default;
+        # callers that want them in (e.g. auto-surfacing) opt in with
+        # pools=[..., "chunk"].
         pools = ["memory", "bank", "conversation"]
 
     if (after or before) and "bank" in pools:
@@ -2397,7 +2390,10 @@ def unified_search(
         all_rankings += [c_fts, c_vec, c_like]
         all_details.update(c_det)
 
-        # Chunk search: FTS + vector + graph expansion
+    # Chunk search is now its own opt-in pool (was always tacked onto the
+    # conversation branch). Auto-surfacing wants chunks; manual search
+    # (memory_search MCP tool) wants raw originals only.
+    if "chunk" in pools:
         ch_fts, ch_vec, ch_det = _search_chunk_channels(query_vec, db, query=expanded_query)
         if ch_fts:
             all_rankings.append(ch_fts)
@@ -2478,13 +2474,22 @@ def unified_search(
             continue
         max_score = max(r["score"] for r in items)
         max_vec = max((r.get("vec_similarity") or 0) for r in items)
-        has_fts = any(r.get("rrf_raw", 0) > 0.02 for r in items)
+        # 0.01 covers FTS rank 1-40 (1/61 = 0.0164, 1/100 = 0.01). The old
+        # 0.02 threshold only counted pools whose top hit also had vec or
+        # like signal stacking onto FTS — conv pool, which currently runs
+        # without a vec channel, never qualified and got the 0.15 noise
+        # penalty even on strong keyword matches like "马桶".
+        has_fts = any(r.get("rrf_raw", 0) > 0.01 for r in items)
         if time_pinned and pool == "chunk":
             pool_conf = 1.0
         elif max_vec >= VEC_CONFIDENCE_GOOD:
             pool_conf = 1.0
         elif has_fts:
-            pool_conf = max(0.6, 0.15 + 0.85 * max(0, (max_vec - VEC_CONFIDENCE_NOISE)) / (VEC_CONFIDENCE_GOOD - VEC_CONFIDENCE_NOISE))
+            # FTS keyword match is strong evidence on its own — promote to
+            # full confidence so the conversation pool (which currently
+            # ships without a vec channel) can compete against memory hits
+            # that have both FTS and vec signals.
+            pool_conf = 1.0
         elif max_vec <= VEC_CONFIDENCE_NOISE:
             pool_conf = 0.15
         else:
@@ -2700,12 +2705,26 @@ def _extract_time_intent(query: str) -> tuple[str, str | None, str | None]:
             )
             if ents:
                 ent = ents[0]
+                ent_text = (ent.get("text") or "").strip()
+                # Bare time-of-day words ("凌晨", "下午", "晚上"...) by
+                # themselves describe a recurring slice of day, not a
+                # specific date. jionlp eagerly pins them to today, which
+                # collapses every "凌晨 ... 拉屎" style query to zero hits
+                # because today's log has nothing. Skip the parse unless
+                # the matched surface text actually carries a date anchor.
+                _has_date_anchor = bool(re.search(
+                    r"\d|[今昨明前后]天|这?[周月年]|去年|前年|明年|"
+                    r"[1-9]\d?[日号月]|周[一二三四五六日]",
+                    ent_text,
+                ))
+                if not _has_date_anchor:
+                    return query, None, None
                 detail = ent.get("detail") or {}
                 t = detail.get("time")
                 if t and len(t) == 2:
                     after_date = t[0][:10]
                     before_date = t[1][:10]
-                    cleaned = query.replace(ent.get("text", ""), "", 1).strip()
+                    cleaned = query.replace(ent_text, "", 1).strip()
                     if not cleaned:
                         cleaned = query
                     return cleaned, after_date, before_date
@@ -2946,7 +2965,17 @@ def surfacing_search(query: str, limit: int = 3) -> str:
         inner_limit = max(limit, 12)
     else:
         inner_limit = limit
-    results = unified_search(search_query or query, limit=inner_limit, rerank=False, after=after, before=before)
+    # Surfacing wants chunk summaries (legibility) + raw originals + memories
+    # + bank, all four pools. Manual search (memory_search MCP tool) uses the
+    # default 3-pool set without chunks.
+    results = unified_search(
+        search_query or query,
+        limit=inner_limit,
+        rerank=False,
+        after=after,
+        before=before,
+        pools=["memory", "bank", "conversation", "chunk"],
+    )
     if not results:
         return ""
 
