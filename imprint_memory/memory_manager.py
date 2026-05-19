@@ -2881,31 +2881,33 @@ def unified_search_text(
 
         elif r["pool"] == "chunk":
             # Chunk acts as a navigation index — surface the raw originals
-            # the chunk points to, not the chunk's own summary. Each
-            # expanded message lands on its own labeled line so the caller
-            # sees real chat, while the chunk-level FTS / vec match
-            # provided the recall power. Dedup by (speaker, content): the
-            # same message repeated (e.g. "@gemini …" tapped four times)
-            # should appear once, not flood the result page.
+            # the chunk points to, not the chunk's own summary. All
+            # expansion messages from the same chunk share ONE header
+            # (timestamp + score), with the messages indented underneath
+            # so the caller can see at a glance "these turns belong to
+            # the same conversation". Without the shared header each
+            # line carried its own [原文|...] tag and it was impossible
+            # to tell which two turns were consecutive vs which jumped
+            # to a different chunk. Dedup by (speaker, content) still
+            # applies — same line repeated 3-4x collapses to one.
+            chunk_lines: list[str] = []
             for em in r.get("expanded", []):
                 raw = em.get("content", "") or ""
                 em_text = _clean_msg_for_display(raw)
                 if len(em_text) < 5:
                     continue
                 em_sp = em.get("speaker") or ""
-                # Collapse embedded newlines + runs of whitespace so each
-                # snippet renders on a single line — multi-line raw
-                # messages otherwise punched 10+ empty lines between
-                # paragraphs into the result block.
                 em_text = " ".join(em_text.split())
                 sig = (em_sp, em_text)
                 if sig in seen_em_sigs:
                     continue
                 seen_em_sigs.add(sig)
-                em_ts = (em.get("created_at") or r.get("start_time") or "")[:16]
-                lines.append(
-                    f"[原文|{em_ts}] ({score:.3f}) {em_sp}: {em_text[:200]}"
-                )
+                chunk_lines.append(f"    {em_sp}: {em_text[:200]}")
+            if chunk_lines:
+                chunk_ts = (r.get("start_time") or "")[:16]
+                lines.append("")  # blank line separates chunks
+                lines.append(f"━━ 原文 {chunk_ts}  (score {score:.2f}) ━━")
+                lines.extend(chunk_lines)
 
     # Extra section: chunk graph expansion + memory edge expansion
     extra = []
