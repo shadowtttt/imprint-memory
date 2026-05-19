@@ -3027,19 +3027,27 @@ def surfacing_search(query: str, limit: int = 3) -> str:
     mem_label = "记忆" if locale == "zh" else "Memory"
     conv_label = "对话" if locale == "zh" else "Chat"
 
+    def _oneline(s: str) -> str:
+        # Collapse embedded newlines + runs of whitespace so each snippet
+        # renders on a single line — multi-line raw messages otherwise
+        # punched empty lines into the surfacing block.
+        return " ".join((s or "").split())
+
+    idx = 0  # 1-based item counter for chunk/memory/conv hits
     for r in results:
         if r.get("score", 0) <= 0 or r.get("source") == "edge":
             continue
+        idx += 1
 
         if r["pool"] == "memory":
-            content = _smart_truncate(r.get("content", "") or "")
+            content = _oneline(_smart_truncate(r.get("content", "") or ""))
             ts = (r.get("created_at", "") or "")[:10]
-            lines.append(f"[{mem_label}|{ts}] {content}")
+            lines.append(f"{idx}. [{mem_label}|{ts}] {content}")
 
         elif r["pool"] == "chunk":
-            summary = _smart_truncate(r.get("summary", r.get("content", "")) or "")
+            summary = _oneline(_smart_truncate(r.get("summary", r.get("content", "")) or ""))
             ts = (r.get("start_time", "") or "")[:10]
-            lines.append(f"[{ts}] {summary}")
+            lines.append(f"{idx}. [{ts}] {summary}")
             expanded = r.get("expanded", [])
             # When the chunk's expansion contains an image-anchored unit, show
             # that whole unit (image + neighbour turns); otherwise show the
@@ -3050,27 +3058,29 @@ def surfacing_search(query: str, limit: int = 3) -> str:
                 hi = min(len(expanded), anchor_idx + 2)
                 for e in expanded[lo:hi]:
                     img = f" [📷 {e['image_path']}]" if e.get("image_path") else ""
-                    lines.append(f"  {e['speaker']}: {_smart_truncate(e['content'])}{img}")
+                    body = _oneline(_smart_truncate(e["content"]))
+                    lines.append(f"   原文截取：{e['speaker']}: {body}{img}")
             elif expanded:
                 # Show top 3 expanded messages (already ranked by hybrid keyword
                 # + per-message embedding inside _expand_chunk_hybrid). Earlier
                 # this used expanded[0] only and wasted the ranking work.
                 for e in expanded[:3]:
                     img = f" [📷 {e['image_path']}]" if e.get("image_path") else ""
-                    lines.append(f"  {e['speaker']}: {_smart_truncate(e['content'])}{img}")
+                    body = _oneline(_smart_truncate(e["content"]))
+                    lines.append(f"   原文截取：{e['speaker']}: {body}{img}")
 
         elif r["pool"] == "conversation":
-            content = _smart_truncate(_clean_msg_for_display(r.get("content", "") or ""))
+            content = _oneline(_smart_truncate(_clean_msg_for_display(r.get("content", "") or "")))
             sp = r.get("speaker") or (USER_NAME if r.get("direction") == "in" else AGENT_NAME)
             ts = (r.get("created_at", "") or "")[:10]
-            lines.append(f"[{conv_label}|{ts}] {sp}: {content}")
+            lines.append(f"{idx}. [{conv_label}|{ts}] {sp}: {content}")
 
     if not lines:
         return ""
 
     graph = _graph_expansion_section(query, results, limit=2)
     if graph:
-        lines.append(f"— {graph[0]}")
+        lines.append(f"关联图谱：{graph[0]}")
 
     return "\n".join(lines)
 
@@ -3146,9 +3156,14 @@ def _graph_expansion_section(query: str, rrf_results: list[dict], limit: int = 5
 
                 seen_ids.add(n["target_id"])
                 ts = (n["start_time"] or "")[:10]
-                kw = n["keywords"] or ""
-                summary = (n["summary"] or "")[:80]
-                lines.append(f"[Graph|{ts}] [{kw}] {summary}")
+                kw = (n["keywords"] or "").strip()
+                summary = " ".join((n["summary"] or "").split())[:80]
+                # Drop the "[]" brackets entirely when the chunk has no
+                # keywords — otherwise the output reads "[Graph|date] []  ...".
+                if kw:
+                    lines.append(f"[Graph|{ts}] [{kw}] {summary}")
+                else:
+                    lines.append(f"[Graph|{ts}] {summary}")
 
                 if len(lines) >= limit:
                     return lines
