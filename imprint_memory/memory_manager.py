@@ -2372,13 +2372,13 @@ def unified_search(
         pool, score, rrf_raw, id, content, + pool-specific fields
     """
     if pools is None:
-        # Default: search the three "primary" pools that hold authoritative
-        # content — memory (curated facts), bank (markdown notes),
-        # conversation (raw chat log). Chunk summaries are an indexing
-        # convenience for surfacing, not a search target by default;
-        # callers that want them in (e.g. auto-surfacing) opt in with
-        # pools=[..., "chunk"].
-        pools = ["memory", "bank", "conversation"]
+        # Default: chunks act as a navigation index over the raw chat log.
+        # We search memory (curated facts), bank (markdown notes), and
+        # chunks; for chunk hits the renderer expands each one into its
+        # top-ranked raw messages rather than echoing the chunk summary —
+        # so the user always sees originals while still benefitting from
+        # chunk-level keyword / topic matching.
+        pools = ["memory", "bank", "chunk"]
 
     if (after or before) and "bank" in pools:
         pools = [p for p in pools if p != "bank"]
@@ -2816,11 +2816,21 @@ def unified_search_text(
             lines.append(f"[{label}|{plat}{dire}|{ts}] ({score:.3f}) {content}")
 
         elif r["pool"] == "chunk":
-            ts = r.get("start_time", "")[:10]
-            kw = r.get("keywords", "")
-            lines.append(f"[Chunk|{ts}] ({score:.3f}) [{kw}] {content[:100]}")
+            # Chunk acts as a navigation index — surface the raw originals
+            # the chunk points to, not the chunk's own summary. Each
+            # expanded message lands on its own labeled line so the user
+            # sees real chat, while the chunk-level FTS / vec match
+            # provided the recall power.
             for em in r.get("expanded", []):
-                lines.append(f"  {em['speaker']}: {em['content'][:200]}")
+                raw = em.get("content", "") or ""
+                em_text = _clean_msg_for_display(raw)
+                if len(em_text) < 5:
+                    continue
+                em_sp = em.get("speaker") or ""
+                em_ts = (em.get("created_at") or r.get("start_time") or "")[:16]
+                lines.append(
+                    f"[原文|{em_ts}] ({score:.3f}) {em_sp}: {em_text[:200]}"
+                )
 
     # Extra section: chunk graph expansion + memory edge expansion
     extra = []
