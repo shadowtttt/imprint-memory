@@ -115,7 +115,10 @@ def log_message(
 
     `is_test`: if None (default), auto-detect from content for direction='in'
     messages, and inherit from the active test-turn marker for 'out'. Pass
-    True/False explicitly to override.
+    True/False explicitly to override. Test-flagged messages are dropped
+    entirely — they never reach conversation_log — so surfacing / search /
+    chunking all see only real data while the user still gets a chance to
+    exercise the live recall path with throwaway prompts.
     """
     if not content or not content.strip():
         return {"ok": False, "error": "empty content"}
@@ -139,9 +142,13 @@ def log_message(
         else:
             # 'out' (and any non-'in' direction) inherits whatever the
             # current turn was flagged as. So an assistant reply to a
-            # "测试：..." prompt is also is_test=1.
+            # "测试：..." prompt is also treated as test.
             is_test = _turn_is_test()
-    test_flag = 1 if is_test else 0
+
+    # Test-flagged messages never hit the DB. Caller still gets a successful
+    # response so channel adapters don't think the write failed.
+    if is_test:
+        return {"ok": True, "id": None, "skipped": "test"}
 
     db = _get_db()
     try:
@@ -167,8 +174,8 @@ def log_message(
 
         cur = db.execute(
             """INSERT INTO conversation_log
-               (platform, direction, speaker, content, external_id, session_id, entrypoint, created_at, summary, model, is_test)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (platform, direction, speaker, content, external_id, session_id, entrypoint, created_at, summary, model)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 platform,
                 direction,
@@ -180,16 +187,12 @@ def log_message(
                 ts,
                 summary,
                 model,
-                test_flag,
             ),
         )
         db.commit()
         msg_id = cur.lastrowid
-        # Skip multimodal embed for test messages — saves API tokens and
-        # keeps test-image vectors out of the live search pool.
-        if not test_flag:
-            _maybe_embed_image(msg_id, clean_content, db)
-        return {"ok": True, "id": msg_id, "is_test": bool(test_flag)}
+        _maybe_embed_image(msg_id, clean_content, db)
+        return {"ok": True, "id": msg_id}
     finally:
         db.close()
 
