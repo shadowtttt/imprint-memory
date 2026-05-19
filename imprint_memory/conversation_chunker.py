@@ -390,12 +390,19 @@ def _get_last_chunked_msg_id(db) -> int:
 
 def _fetch_unchunked_messages(db, after_id: int, limit: int = 2000) -> list[dict]:
     platform_sql, platform_params = _platform_exclusion("c.platform")
+    # is_test messages (user prompts opening with "测试：" / "test:" and their
+    # follow-up turns) are excluded from chunking so test exchanges never
+    # become recallable chunks. The column might be absent on legacy DBs, so
+    # check first and only filter when it exists.
+    cols = {r["name"] if hasattr(r, "keys") else r[1]
+            for r in db.execute("PRAGMA table_info(conversation_log)").fetchall()}
+    test_filter = "AND COALESCE(c.is_test, 0) = 0" if "is_test" in cols else ""
     rows = db.execute(
         f"""SELECT c.id, c.platform, c.direction, c.speaker, c.content,
                    c.session_id, c.created_at, v.embedding
             FROM conversation_log c
             LEFT JOIN conversation_vectors v ON c.id = v.msg_id
-            WHERE c.id > ? {platform_sql}
+            WHERE c.id > ? {platform_sql} {test_filter}
             ORDER BY c.id
             LIMIT ?""",
         (after_id, *platform_params, limit),

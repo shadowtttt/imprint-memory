@@ -55,6 +55,46 @@ def _maybe_embed_image(msg_id: int, content: str, db) -> None:
         pass
 
 
+# Matches "测试：xx" / "测试: xx" / "test: xx" prefix on a user message,
+# case-insensitive, optional whitespace. When the *user* opens a turn with
+# this prefix we treat the whole turn as test data: it still lands in
+# conversation_log for traceability, but with is_test=1 so chunker,
+# surfacing, and search all skip it cleanly.
+_TEST_PREFIX_RE = re.compile(r"^\s*(?:测试|test)\s*[：:]", re.IGNORECASE)
+
+
+def _is_test_content(content: str) -> bool:
+    """True if the user-side content opens with a test marker."""
+    if not content:
+        return False
+    return bool(_TEST_PREFIX_RE.match(content))
+
+
+# Process-local marker — when a turn is flagged as test (either by the
+# user prompt prefix or explicitly by the caller), subsequent log writes
+# in the same process for that turn inherit the flag. Channel adapters
+# write the inbound "in" message first and then the outbound "out" reply;
+# we want both to share the same is_test status.
+_test_turn_active = False
+
+
+def _turn_is_test() -> bool:
+    return _test_turn_active
+
+
+def begin_test_turn():
+    """Mark the rest of the current logical turn as test data. Channel
+    adapters call this when they detect the user prompt starts with a
+    test marker, so the agent's reply also gets is_test=1."""
+    global _test_turn_active
+    _test_turn_active = True
+
+
+def end_test_turn():
+    global _test_turn_active
+    _test_turn_active = False
+
+
 def log_message(
     platform: str,
     direction: str,
@@ -66,11 +106,16 @@ def log_message(
     summary: str = "",
     model: str = "",
     external_id: str = "",
+    is_test: bool | None = None,
 ) -> dict:
     """Write one message to conversation_log.
 
     external_id is a stable upstream message id used for dedup when available.
     Older clients can omit it and fall back to content/timestamp dedup.
+
+    `is_test`: if None (default), auto-detect from content for direction='in'
+    messages, and inherit from the active test-turn marker for 'out'. Pass
+    True/False explicitly to override.
     """
     if not content or not content.strip():
         return {"ok": False, "error": "empty content"}
@@ -78,6 +123,26 @@ def log_message(
     ts = created_at or now_str()
     clean_content = content.strip()
     external_id = (external_id or "").strip()
+
+    # Resolve is_test
+    if is_test is None:
+        if direction == "in":
+            # Every new user turn resets test mode — only the explicit prefix
+            # opens it back up. Without this reset, one stray "测试：" earlier
+            # in the process would mark every subsequent turn as test forever.
+            if _is_test_content(clean_content):
+                begin_test_turn()
+                is_test = True
+            else:
+                end_test_turn()
+                is_test = False
+        else:
+            # 'out' (and any non-'in' direction) inherits whatever the
+            # current turn was flagged as. So an assistant reply to a
+            # "测试：..." prompt is also is_test=1.
+            is_test = _turn_is_test()
+    test_flag = 1 if is_test else 0
+
     db = _get_db()
     try:
         # Browser/API sources should provide a stable message id. Treat it as
@@ -102,8 +167,8 @@ def log_message(
 
         cur = db.execute(
             """INSERT INTO conversation_log
-               (platform, direction, speaker, content, external_id, session_id, entrypoint, created_at, summary, model)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (platform, direction, speaker, content, external_id, session_id, entrypoint, created_at, summary, model, is_test)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 platform,
                 direction,
@@ -115,12 +180,16 @@ def log_message(
                 ts,
                 summary,
                 model,
+                test_flag,
             ),
         )
         db.commit()
         msg_id = cur.lastrowid
-        _maybe_embed_image(msg_id, clean_content, db)
-        return {"ok": True, "id": msg_id}
+        # Skip multimodal embed for test messages — saves API tokens and
+        # keeps test-image vectors out of the live search pool.
+        if not test_flag:
+            _maybe_embed_image(msg_id, clean_content, db)
+        return {"ok": True, "id": msg_id, "is_test": bool(test_flag)}
     finally:
         db.close()
 

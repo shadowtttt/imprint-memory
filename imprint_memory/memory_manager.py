@@ -2572,6 +2572,32 @@ def unified_search(
     # Filter out PRIVATE-tagged memories
     results = [r for r in results if not (r.get("content", "").startswith("[PRIVATE]"))]
 
+    # Filter out conversation-pool entries flagged is_test=1. Chunker already
+    # skips test messages so they never become chunks, but conv-pool FTS/LIKE
+    # paths can still surface raw test messages — drop them here in one pass.
+    conv_ids = [r["id"] for r in results
+                if r.get("pool") == "conversation" and r.get("id")]
+    if conv_ids:
+        try:
+            cols = {x["name"] if hasattr(x, "keys") else x[1]
+                    for x in db.execute("PRAGMA table_info(conversation_log)").fetchall()}
+            if "is_test" in cols:
+                placeholders = ",".join("?" for _ in conv_ids)
+                test_ids = {
+                    row["id"] if hasattr(row, "keys") else row[0]
+                    for row in db.execute(
+                        f"SELECT id FROM conversation_log "
+                        f"WHERE id IN ({placeholders}) AND is_test = 1",
+                        conv_ids,
+                    ).fetchall()
+                }
+                if test_ids:
+                    results = [r for r in results
+                               if not (r.get("pool") == "conversation"
+                                       and r.get("id") in test_ids)]
+        except Exception:
+            pass
+
     # LLM rerank: take top-20 candidates, ask LLM to score relevance
     if rerank and len(results) > 3:
         results = _llm_rerank(query, results[:20])

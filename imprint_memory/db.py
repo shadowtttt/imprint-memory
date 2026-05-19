@@ -236,6 +236,16 @@ def _init_tables(db: sqlite3.Connection):
             if "duplicate column name" not in str(e).lower():
                 raise
 
+    # Messages whose user-side turn opens with "测试：" / "test:" get
+    # is_test=1 so the chunker, surfacing, and search pools all skip them.
+    if "is_test" not in convlog_cols:
+        try:
+            db.execute("ALTER TABLE conversation_log ADD COLUMN is_test INTEGER DEFAULT 0")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_convlog_is_test ON conversation_log(is_test)")
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
+
     db.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_conversation_log_external_id
         ON conversation_log(platform, external_id)
