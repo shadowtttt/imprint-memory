@@ -2183,6 +2183,16 @@ def _expand_chunk_hybrid(query: str, query_vec, results: list[dict], db, max_msg
             kw_matched = sum(1 for t in term_set if t in lower)
             kw_score = kw_matched / len(term_set) if term_set else 0
 
+            # Density bonus: short messages with a direct keyword hit
+            # signal a concise topical line. "我要去拉屎了！" (7 chars hitting
+            # "拉屎") should beat a 200-char paragraph that mentions the term
+            # in passing. The 60-char threshold is generous so a short reply
+            # like "你看到马桶了吗？" still qualifies, while paragraph-length
+            # messages get their density boost capped to zero.
+            density_bonus = 0.0
+            if kw_matched > 0 and len(clean) < 60:
+                density_bonus = min(0.4, 0.6 * kw_matched / max(len(clean), 5))
+
             # Embedding score (only for long chunks)
             emb_score = 0.0
             if use_embedding:
@@ -2194,11 +2204,11 @@ def _expand_chunk_hybrid(query: str, query_vec, results: list[dict], db, max_msg
                     vec = _blob_to_vec(vrow["embedding"])
                     emb_score = _cosine_similarity(query_vec, vec)
 
-            # Hybrid: embedding as base, keyword as boost
+            # Hybrid: embedding as base, keyword as boost, density on top
             if use_embedding:
-                score = emb_score + kw_score * 0.3
+                score = emb_score + kw_score * 0.3 + density_bonus
             else:
-                score = kw_score
+                score = kw_score + density_bonus
 
             speaker = m["speaker"] or (USER_NAME if m["direction"] == "in" else AGENT_NAME)
             scored.append((score, m["id"], speaker, display[:300]))
