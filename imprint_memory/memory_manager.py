@@ -1298,6 +1298,7 @@ def _search_chunk_channels(query_vec, db, query="", limit=20):
                    FROM chunks_fts f
                    JOIN conversation_chunks c ON f.rowid = c.id
                    WHERE chunks_fts MATCH ?
+                   ORDER BY f.rank
                    LIMIT ?""",
                 (fts_q, limit),
             ).fetchall()
