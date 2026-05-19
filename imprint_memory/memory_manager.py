@@ -2607,14 +2607,25 @@ def unified_search(
         deduped.append(r)
     results = deduped
 
-    # Standalone image-upload messages have no value on their own ("[uploaded
-    # a file…]" with no surrounding context). Drop them from final results —
-    # they only make sense as part of a chunk expansion, where image-anchor
-    # logic in _expand_chunk_hybrid surfaces them with neighbour turns.
-    results = [
-        r for r in results
-        if not (r.get("pool") == "conversation" and _extract_image_path(r.get("content", "") or ""))
-    ]
+    # Drop standalone image-upload messages ONLY when they're effectively
+    # naked metadata — "[uploaded a file: 路径=...]" with no accompanying
+    # caption. If the user typed something alongside the image
+    # ("[uploaded ...] 看这张截图"), keep the row: the caption + multimodal
+    # vec both carry signal, and waiting for the chunker to swallow it
+    # before search can see it makes new images un-findable for hours.
+    def _is_metadata_only_image(row: dict) -> bool:
+        if row.get("pool") != "conversation":
+            return False
+        raw = row.get("content", "") or ""
+        if not _extract_image_path(raw):
+            return False
+        # Strip the upload header + adapter wrappers; what's left is the
+        # human caption. If <5 chars after stripping, treat as bare upload.
+        stripped = _clean_msg_for_display(raw)
+        stripped = re.sub(r"上传了一个文件:[^\]]*", "", stripped).strip()
+        return len(stripped) < 5
+
+    results = [r for r in results if not _is_metadata_only_image(r)]
 
     # Dedup: conversation messages covered by a chunk's range → drop
     chunk_ranges = [(ks, ke) for ks, ke in kept_ranges]
@@ -3229,16 +3240,21 @@ _GRAPH_EDGE_FLOOR = 0.75
 def _graph_expansion_section(query: str, rrf_results: list[dict], limit: int = 5) -> list[str]:
     """Generate graph-expansion section.
 
-    True graph traversal (Zep/Graphiti style): seed chunks come from the
-    primary search; neighbours are picked purely by edge strength
-    (similarity × strength). Neighbours do NOT have to re-match the query
-    keywords — that's the whole point of a graph layer. It surfaces
-    "events on the same arc" that vec/FTS would miss because they don't
-    happen to share surface vocabulary with the query.
+    Hybrid retrieval (Zep/Graphiti style): seed chunks come from the
+    primary search; neighbours are pulled along chunk_edges, then
+    re-ranked by their own embedding cosine to the query so the graph
+    layer surfaces "events on the same arc that DO relate to the
+    query topic" — not just "anything strongly linked to the seed".
 
-    The only neighbour filter still kept is the near-duplicate cap
-    (keyword overlap with seed > 70% means it's basically the same
-    chunk, drop it)."""
+    Pure edge-strength sorting (which is what a naive BFS gives you)
+    drags in chunks that happen to be temporally adjacent to the seed
+    but topically off (e.g. searching "拉屎" surfaces a chunk about
+    Tononi's integrated information theory just because they were
+    discussed the same day). Re-ranking by query similarity keeps the
+    graph honest.
+
+    Near-duplicate cap (keyword overlap with seed > 70%) still
+    applies — that's dedup, not topic filtering."""
     seen_ids = set()
     seed_chunk_ids = []
     for r in rrf_results:
@@ -3261,17 +3277,33 @@ def _graph_expansion_section(query: str, rrf_results: list[dict], limit: int = 5
     except Exception:
         pass
 
-    lines = []
+    # Query terms (post-stopword) for the keyword-boost rerank. Chunk
+    # embeddings are stored from a different embedder dim (3072) than the
+    # current one (1024), so vec-sim rerank is unusable until embeddings
+    # are rebuilt. Keyword overlap on the summary text is the cheap stand-in.
+    if _JIEBA_OK:
+        from jieba import cut
+        query_terms = filter_stopwords(
+            [w.strip().lower() for w in cut(query) if len(w.strip()) >= 2]
+        )
+    else:
+        query_terms = filter_stopwords(
+            [w.lower() for w in query.split() if len(w) >= 2]
+        )
+    query_terms_set = set(query_terms)
+
+    lines: list[str] = []
+    candidates = []  # (composite_score, target_id, summary, ts)
     try:
         for seed_id in seed_chunk_ids[:3]:
             neighbors = db.execute(
-                """SELECT ce.target_id, ce.similarity * ce.strength as score,
+                """SELECT ce.target_id, ce.similarity * ce.strength as edge_score,
                           c.summary, c.keywords, c.start_time
                    FROM chunk_edges ce
                    JOIN conversation_chunks c ON c.id = ce.target_id
                    WHERE ce.source_id = ? AND ce.target_id NOT IN ({})
                      AND ce.similarity * ce.strength >= ?
-                   ORDER BY score DESC LIMIT 5""".format(
+                   ORDER BY edge_score DESC LIMIT 10""".format(
                     ",".join(str(i) for i in seen_ids) if seen_ids else "0"
                 ),
                 (seed_id, _GRAPH_EDGE_FLOOR),
@@ -3284,26 +3316,29 @@ def _graph_expansion_section(query: str, rrf_results: list[dict], limit: int = 5
                 n_kws = {k.strip().lower() for k in (n["keywords"] or "").split(",") if k.strip()}
                 if seed_keywords and n_kws:
                     overlap = len(n_kws & seed_keywords) / max(len(n_kws), 1)
-                    # Skip near-duplicate neighbours only (>70% keyword
-                    # overlap = basically the same chunk). Topic-level
-                    # overlap (0.3-0.7) is the kind of relation we WANT
-                    # graph to surface.
                     if overlap > 0.7:
                         continue
 
-                seen_ids.add(n["target_id"])
-                ts = (n["start_time"] or "")[:10]
-                # Drop the dumped keyword list — it's the LLM's own
-                # tagging of the chunk and it's both noisy (15+ tokens
-                # per chunk) and useless to the reader (a bare list of
-                # tags doesn't explain why this chunk is linked).
-                # Show the summary with a longer cutoff instead — that's
-                # where the actual relation lives.
-                summary = " ".join((n["summary"] or "").split())[:180]
-                lines.append(f"[Graph|{ts}] {summary}")
+                # Keyword-boost rerank: count query terms that show up in
+                # the neighbour's summary. 0 hits gets the floor multiplier
+                # so a 0.8-edge, 0-keyword chunk still loses to a 0.6-edge,
+                # 2-keyword chunk. Stays as a soft boost not a hard cut —
+                # graph value is "things keyword search would miss".
+                summary_text = " ".join((n["summary"] or "").split())
+                hits = sum(1 for t in query_terms_set if t in summary_text.lower())
+                kw_boost = hits / max(len(query_terms_set), 1)
+                composite = float(n["edge_score"]) * (0.3 + 0.7 * kw_boost)
 
-                if len(lines) >= limit:
-                    return lines
+                ts = (n["start_time"] or "")[:10]
+                candidates.append(
+                    (composite, n["target_id"], summary_text[:180], ts)
+                )
+
+        # Global rerank, take top limit.
+        candidates.sort(key=lambda x: -x[0])
+        for composite, tid, summary, ts in candidates[:limit]:
+            seen_ids.add(tid)
+            lines.append(f"[Graph|{ts}] {summary}")
     except Exception:
         pass
     finally:

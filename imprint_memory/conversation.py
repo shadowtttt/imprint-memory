@@ -46,8 +46,14 @@ def _test_mode_active(session_id: str = "") -> bool:
 # convention used across our channels: "上传了一个文件: 文件名=...; MIME=...;
 # 路径=/abs/path.ext". Other adapters can adopt the same shape to get
 # automatic multimodal indexing.
+#
+# Path body is constrained to ASCII filesystem chars (no Chinese, no
+# whitespace, no markdown punctuation) capped at 300 chars. Earlier
+# we used [^;\]]+? which let chat messages *quoting* the header (e.g.
+# "...路径=foo.jpg`，立即跑 embed → ...") bleed Chinese narrative into
+# the captured path, producing 1000+ char fake paths.
 _UPLOAD_PATH_RE = re.compile(
-    r"上传了一个文件:.*?路径=([^;\]]+?\.(?:jpg|jpeg|png|gif|webp))(?:\s|;|\])",
+    r"上传了一个文件:.*?路径=(/[/A-Za-z0-9_.\-]{0,299}\.(?:jpg|jpeg|png|gif|webp))",
     re.IGNORECASE | re.DOTALL,
 )
 _IMG_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
