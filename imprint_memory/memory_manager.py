@@ -2784,6 +2784,10 @@ def unified_search_text(
     _labels = {k: loc[k] for k in ("memory", "bank", "conversation")}
     lines: list[str] = []
     edge_lines: list[str] = []
+    # Dedup expanded messages by (speaker, text) across all chunk hits —
+    # repeated identical messages (same line sent 3-4 times) would
+    # otherwise flood the result page.
+    seen_em_sigs: set[tuple[str, str]] = set()
 
     for r in results:
         label = _labels.get(r["pool"], r["pool"])
@@ -2820,13 +2824,19 @@ def unified_search_text(
             # the chunk points to, not the chunk's own summary. Each
             # expanded message lands on its own labeled line so the user
             # sees real chat, while the chunk-level FTS / vec match
-            # provided the recall power.
+            # provided the recall power. Dedup by (speaker, content): the
+            # same message repeated by the user (e.g. "@gemini …" tapped
+            # four times) should appear once, not flood the result page.
             for em in r.get("expanded", []):
                 raw = em.get("content", "") or ""
                 em_text = _clean_msg_for_display(raw)
                 if len(em_text) < 5:
                     continue
                 em_sp = em.get("speaker") or ""
+                sig = (em_sp, em_text)
+                if sig in seen_em_sigs:
+                    continue
+                seen_em_sigs.add(sig)
                 em_ts = (em.get("created_at") or r.get("start_time") or "")[:16]
                 lines.append(
                     f"[原文|{em_ts}] ({score:.3f}) {em_sp}: {em_text[:200]}"
@@ -3091,12 +3101,25 @@ def surfacing_search(query: str, limit: int = 3) -> str:
     locale = os.environ.get("IMPRINT_LOCALE", "en")
     mem_label = "记忆" if locale == "zh" else "Memory"
     conv_label = "对话" if locale == "zh" else "Chat"
+    # Dedup expanded messages by (speaker, text) — same line repeated 3-4
+    # times (e.g. "@gemini …" tapped over and over) should appear once.
+    seen_em_sigs: set[tuple[str, str]] = set()
 
     def _oneline(s: str) -> str:
         # Collapse embedded newlines + runs of whitespace so each snippet
         # renders on a single line — multi-line raw messages otherwise
         # punched empty lines into the surfacing block.
         return " ".join((s or "").split())
+
+    def _emit_expansion(e: dict) -> None:
+        img = f" [📷 {e['image_path']}]" if e.get("image_path") else ""
+        body = _oneline(_smart_truncate(e["content"]))
+        sp = e.get("speaker") or ""
+        sig = (sp, body)
+        if sig in seen_em_sigs:
+            return
+        seen_em_sigs.add(sig)
+        lines.append(f"   原文截取：{sp}: {body}{img}")
 
     idx = 0  # 1-based item counter for chunk/memory/conv hits
     for r in results:
@@ -3122,17 +3145,13 @@ def surfacing_search(query: str, limit: int = 3) -> str:
                 lo = max(0, anchor_idx - 1)
                 hi = min(len(expanded), anchor_idx + 2)
                 for e in expanded[lo:hi]:
-                    img = f" [📷 {e['image_path']}]" if e.get("image_path") else ""
-                    body = _oneline(_smart_truncate(e["content"]))
-                    lines.append(f"   原文截取：{e['speaker']}: {body}{img}")
+                    _emit_expansion(e)
             elif expanded:
                 # Show top 3 expanded messages (already ranked by hybrid keyword
                 # + per-message embedding inside _expand_chunk_hybrid). Earlier
                 # this used expanded[0] only and wasted the ranking work.
                 for e in expanded[:3]:
-                    img = f" [📷 {e['image_path']}]" if e.get("image_path") else ""
-                    body = _oneline(_smart_truncate(e["content"]))
-                    lines.append(f"   原文截取：{e['speaker']}: {body}{img}")
+                    _emit_expansion(e)
 
         elif r["pool"] == "conversation":
             content = _oneline(_smart_truncate(_clean_msg_for_display(r.get("content", "") or "")))
