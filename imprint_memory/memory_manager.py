@@ -3228,7 +3228,17 @@ _GRAPH_EDGE_FLOOR = 0.75
 
 def _graph_expansion_section(query: str, rrf_results: list[dict], limit: int = 5) -> list[str]:
     """Generate graph-expansion section.
-    Filters: edge score >= 0.75 AND neighbor must share at least one keyword with query."""
+
+    True graph traversal (Zep/Graphiti style): seed chunks come from the
+    primary search; neighbours are picked purely by edge strength
+    (similarity × strength). Neighbours do NOT have to re-match the query
+    keywords — that's the whole point of a graph layer. It surfaces
+    "events on the same arc" that vec/FTS would miss because they don't
+    happen to share surface vocabulary with the query.
+
+    The only neighbour filter still kept is the near-duplicate cap
+    (keyword overlap with seed > 70% means it's basically the same
+    chunk, drop it)."""
     seen_ids = set()
     seed_chunk_ids = []
     for r in rrf_results:
@@ -3240,12 +3250,6 @@ def _graph_expansion_section(query: str, rrf_results: list[dict], limit: int = 5
 
     if not seed_chunk_ids:
         return []
-
-    if _JIEBA_OK:
-        from jieba import cut
-        query_terms = {w.strip().lower() for w in cut(query) if len(w.strip()) >= 2}
-    else:
-        query_terms = {w.lower() for w in query.split() if len(w) >= 2}
 
     seed_keywords = set()
     db = _get_db()
@@ -3277,18 +3281,13 @@ def _graph_expansion_section(query: str, rrf_results: list[dict], limit: int = 5
                 if n["target_id"] in seen_ids:
                     continue
 
-                text = ((n["summary"] or "") + " " + (n["keywords"] or "")).lower()
-                if not any(t in text for t in query_terms):
-                    continue
-
                 n_kws = {k.strip().lower() for k in (n["keywords"] or "").split(",") if k.strip()}
                 if seed_keywords and n_kws:
                     overlap = len(n_kws & seed_keywords) / max(len(n_kws), 1)
-                    # Only skip near-duplicate neighbours. Older threshold (0.3)
-                    # treated "same broad topic" as duplicate, so when a topic
-                    # was discussed across many chunks the entire graph layer
-                    # got filtered to empty. 0.7 keeps only chunks that share
-                    # almost all of their keywords (true repeat events).
+                    # Skip near-duplicate neighbours only (>70% keyword
+                    # overlap = basically the same chunk). Topic-level
+                    # overlap (0.3-0.7) is the kind of relation we WANT
+                    # graph to surface.
                     if overlap > 0.7:
                         continue
 
