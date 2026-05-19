@@ -7,8 +7,28 @@ import re
 import struct
 from pathlib import Path
 
-from .db import _get_db, now_str, LOCAL_TZ, segment_cjk, sanitize_fts_query
+from .db import _get_db, now_str, LOCAL_TZ, segment_cjk, sanitize_fts_query, DATA_DIR
 from datetime import datetime
+
+
+# ─── Session-level test mode ──────────────────────────────────────────
+# Touch <IMPRINT_DATA_DIR>/.test-mode to suppress every DB write for the
+# duration of a debug session — useful when you're stress-testing
+# surfacing / search and don't want a flood of garbage messages
+# polluting conversation_log. Remove the file to resume normal logging.
+# Per-message "测试：" prefix detection still works underneath; this is
+# the bulk-mode equivalent.
+_TEST_MODE_MARKER = DATA_DIR / ".test-mode"
+
+
+def _test_mode_active() -> bool:
+    """True iff the test-mode marker file is present right now. Stat'd
+    on every call (not cached) so toggling the file flips behaviour
+    immediately without any restart."""
+    try:
+        return _TEST_MODE_MARKER.exists()
+    except Exception:
+        return False
 
 
 # Match a channel-adapter-injected upload header. Looking for the Chinese
@@ -122,6 +142,10 @@ def log_message(
     """
     if not content or not content.strip():
         return {"ok": False, "error": "empty content"}
+
+    # Session-level test mode: bypass DB entirely, regardless of content.
+    if _test_mode_active():
+        return {"ok": True, "id": None, "skipped": "test-mode"}
 
     ts = created_at or now_str()
     clean_content = content.strip()
