@@ -2853,7 +2853,11 @@ def _parse_ts(ts: str):
         return None
 
 
-_SENTENCE_END_CHARS = "。！？.!?\n"
+# CJK sentence enders + non-period ASCII enders always terminate a sentence.
+# ASCII '.' is special-cased — it only counts when followed by whitespace
+# or end-of-text so it won't break inside version numbers ("o4.7", "v1.2.3"),
+# URLs ("example.com"), or abbreviations ("Dr.").
+_SENTENCE_END_CHARS = "。！？!?\n"
 
 
 def _smart_truncate(text: str, soft_limit: int = 150, hard_limit: int = 240) -> str:
@@ -2872,7 +2876,12 @@ def _smart_truncate(text: str, soft_limit: int = 150, hard_limit: int = 240) -> 
         return text
     upper = min(hard_limit, len(text))
     for i in range(soft_limit, upper):
-        if text[i] in _SENTENCE_END_CHARS:
+        ch = text[i]
+        if ch in _SENTENCE_END_CHARS:
+            return text[: i + 1].rstrip()
+        # ASCII '.' only counts as a sentence end when followed by whitespace
+        # or end-of-text — otherwise it's likely a decimal, URL, or abbrev.
+        if ch == "." and (i + 1 >= len(text) or text[i + 1] in " \t\n"):
             return text[: i + 1].rstrip()
     if len(text) > hard_limit:
         return text[:hard_limit].rstrip() + "…"
