@@ -11,24 +11,35 @@ from .db import _get_db, now_str, LOCAL_TZ, segment_cjk, sanitize_fts_query, DAT
 from datetime import datetime
 
 
-# ─── Session-level test mode ──────────────────────────────────────────
-# Touch <IMPRINT_DATA_DIR>/.test-mode to suppress every DB write for the
-# duration of a debug session — useful when you're stress-testing
-# surfacing / search and don't want a flood of garbage messages
-# polluting conversation_log. Remove the file to resume normal logging.
-# Per-message "测试：" prefix detection still works underneath; this is
-# the bulk-mode equivalent.
+# ─── Test mode markers (three granularities) ──────────────────────────
+# Three knobs, each independent, checked on every write so toggling
+# any of them flips behaviour immediately without a restart:
+#
+#   1. "测试："/"test:" prefix     → drop one user turn + its agent reply
+#   2. <DATA_DIR>/.test-sessions/<session_id>
+#                                  → drop everything from that one session
+#                                    (other sessions keep logging normally)
+#   3. <DATA_DIR>/.test-mode       → global kill switch, drop every write
+#                                    from every session
+#
+# Per-message prefix lives further down; the two file-based switches
+# are handled here.
 _TEST_MODE_MARKER = DATA_DIR / ".test-mode"
+_TEST_SESSIONS_DIR = DATA_DIR / ".test-sessions"
 
 
-def _test_mode_active() -> bool:
-    """True iff the test-mode marker file is present right now. Stat'd
-    on every call (not cached) so toggling the file flips behaviour
-    immediately without any restart."""
+def _test_mode_active(session_id: str = "") -> bool:
+    """True when EITHER the global .test-mode marker exists OR the given
+    session_id has its own marker file under .test-sessions/. Stat'd on
+    every call (not cached) so toggling flips behaviour immediately."""
     try:
-        return _TEST_MODE_MARKER.exists()
+        if _TEST_MODE_MARKER.exists():
+            return True
+        if session_id and (_TEST_SESSIONS_DIR / session_id).exists():
+            return True
     except Exception:
-        return False
+        pass
+    return False
 
 
 # Match a channel-adapter-injected upload header. Looking for the Chinese
@@ -143,8 +154,8 @@ def log_message(
     if not content or not content.strip():
         return {"ok": False, "error": "empty content"}
 
-    # Session-level test mode: bypass DB entirely, regardless of content.
-    if _test_mode_active():
+    # File-based test mode (global + per-session): bypass DB entirely.
+    if _test_mode_active(session_id):
         return {"ok": True, "id": None, "skipped": "test-mode"}
 
     ts = created_at or now_str()
