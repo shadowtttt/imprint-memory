@@ -1785,10 +1785,25 @@ def _search_conv_channels(query, query_vec, db, *, platform="", limit=50):
                     (safe_q, limit),
                 ).fetchall()
 
-            for idx, r in enumerate(fts_rows):
+            rank_idx = 0
+            for r in fts_rows:
+                # Strip <think> blocks before deciding whether this row
+                # carries actual conversation content. Assistant turns whose
+                # bulk is internal reasoning ("<think>...</think>" with
+                # almost nothing outside) used to win on FTS because the
+                # reasoning matched the keywords — but the user sees
+                # gibberish since reasoning is hidden in real chat. Drop
+                # those entries here so they neither rank nor render.
+                raw_content = r["content"] or ""
+                visible = _THINK_RE.sub("", raw_content).strip()
+                if len(visible) < 5:
+                    continue
                 key = f"conv_{r['id']}"
-                fts_ranking.append((key, idx + 1))
-                details[key] = dict(r)
+                rank_idx += 1
+                fts_ranking.append((key, rank_idx))
+                row_d = dict(r)
+                row_d["content"] = visible  # downstream renderers see the clean version
+                details[key] = row_d
         except Exception:
             pass
 
@@ -1813,11 +1828,19 @@ def _search_conv_channels(query, query_vec, db, *, platform="", limit=50):
                    LIMIT ?""",
                 (f"%{q_lower}%", LIKE_LIMIT),
             ).fetchall()
-        for idx, r in enumerate(like_rows):
+        rank_idx = 0
+        for r in like_rows:
+            raw_content = r["content"] or ""
+            visible = _THINK_RE.sub("", raw_content).strip()
+            if len(visible) < 5:
+                continue
             key = f"conv_{r['id']}"
-            like_ranking.append((key, idx + 1))
+            rank_idx += 1
+            like_ranking.append((key, rank_idx))
             if key not in details:
-                details[key] = dict(r)
+                row_d = dict(r)
+                row_d["content"] = visible
+                details[key] = row_d
 
     # ── Vec ranking over conversation_vectors (may be multimodal) ──
     # Off by default. With many rows the matmul is cheap (~50ms via numpy) but
