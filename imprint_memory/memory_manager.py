@@ -2899,7 +2899,7 @@ def unified_search_text(
     # Extra section: chunk graph expansion + memory edge expansion
     extra = []
     if "conversation" in (pools or ["memory", "bank", "conversation"]):
-        extra = _graph_expansion_section(query, results, limit=5)
+        extra = _graph_expansion_section(query, results, limit=2)
     extra.extend(edge_lines)
 
     if extra:
@@ -3293,14 +3293,14 @@ def _graph_expansion_section(query: str, rrf_results: list[dict], limit: int = 5
 
                 seen_ids.add(n["target_id"])
                 ts = (n["start_time"] or "")[:10]
-                kw = (n["keywords"] or "").strip()
-                summary = " ".join((n["summary"] or "").split())[:80]
-                # Drop the "[]" brackets entirely when the chunk has no
-                # keywords — otherwise the output reads "[Graph|date] []  ...".
-                if kw:
-                    lines.append(f"[Graph|{ts}] [{kw}] {summary}")
-                else:
-                    lines.append(f"[Graph|{ts}] {summary}")
+                # Drop the dumped keyword list — it's the LLM's own
+                # tagging of the chunk and it's both noisy (15+ tokens
+                # per chunk) and useless to the reader (a bare list of
+                # tags doesn't explain why this chunk is linked).
+                # Show the summary with a longer cutoff instead — that's
+                # where the actual relation lives.
+                summary = " ".join((n["summary"] or "").split())[:180]
+                lines.append(f"[Graph|{ts}] {summary}")
 
                 if len(lines) >= limit:
                     return lines
