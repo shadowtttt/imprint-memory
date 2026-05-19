@@ -2827,6 +2827,32 @@ def _parse_ts(ts: str):
         return None
 
 
+_SENTENCE_END_CHARS = "。！？.!?\n"
+
+
+def _smart_truncate(text: str, soft_limit: int = 150, hard_limit: int = 240) -> str:
+    """Truncate around `soft_limit` chars but extend to the next sentence
+    boundary so snippets don't cut mid-thought. Falls back to `hard_limit`
+    when no sentence end shows up before then. Returns the unchanged text
+    when it's already short enough.
+
+    Note: char-based, not byte-based — `len("。")` is 1 in Python strings
+    so the limits are character counts as humans see them.
+    """
+    if not text:
+        return ""
+    text = text.strip()
+    if len(text) <= soft_limit:
+        return text
+    upper = min(hard_limit, len(text))
+    for i in range(soft_limit, upper):
+        if text[i] in _SENTENCE_END_CHARS:
+            return text[: i + 1].rstrip()
+    if len(text) > hard_limit:
+        return text[:hard_limit].rstrip() + "…"
+    return text
+
+
 def surfacing_search(query: str, limit: int = 3) -> str:
     """Compact memory surfacing for auto-recall during conversation.
     Target ~400 chars: chunk summaries + top-1 expanded quote + 1 graph link.
@@ -2963,12 +2989,12 @@ def surfacing_search(query: str, limit: int = 3) -> str:
             continue
 
         if r["pool"] == "memory":
-            content = (r.get("content", "") or "")[:150]
+            content = _smart_truncate(r.get("content", "") or "")
             ts = (r.get("created_at", "") or "")[:10]
             lines.append(f"[{mem_label}|{ts}] {content}")
 
         elif r["pool"] == "chunk":
-            summary = (r.get("summary", r.get("content", "")) or "")[:150]
+            summary = _smart_truncate(r.get("summary", r.get("content", "")) or "")
             ts = (r.get("start_time", "") or "")[:10]
             lines.append(f"[{ts}] {summary}")
             expanded = r.get("expanded", [])
@@ -2981,17 +3007,17 @@ def surfacing_search(query: str, limit: int = 3) -> str:
                 hi = min(len(expanded), anchor_idx + 2)
                 for e in expanded[lo:hi]:
                     img = f" [📷 {e['image_path']}]" if e.get("image_path") else ""
-                    lines.append(f"  {e['speaker']}: {e['content'][:150]}{img}")
+                    lines.append(f"  {e['speaker']}: {_smart_truncate(e['content'])}{img}")
             elif expanded:
                 # Show top 3 expanded messages (already ranked by hybrid keyword
                 # + per-message embedding inside _expand_chunk_hybrid). Earlier
                 # this used expanded[0] only and wasted the ranking work.
                 for e in expanded[:3]:
                     img = f" [📷 {e['image_path']}]" if e.get("image_path") else ""
-                    lines.append(f"  {e['speaker']}: {e['content'][:150]}{img}")
+                    lines.append(f"  {e['speaker']}: {_smart_truncate(e['content'])}{img}")
 
         elif r["pool"] == "conversation":
-            content = _clean_msg_for_display(r.get("content", "") or "")[:150]
+            content = _smart_truncate(_clean_msg_for_display(r.get("content", "") or ""))
             sp = r.get("speaker") or (USER_NAME if r.get("direction") == "in" else AGENT_NAME)
             ts = (r.get("created_at", "") or "")[:10]
             lines.append(f"[{conv_label}|{ts}] {sp}: {content}")
