@@ -97,7 +97,7 @@ def _call_gemini(prompt: str) -> str | None:
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={key}"
     payload = json.dumps({
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1000},
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1500},
     }).encode()
     req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
     try:
@@ -194,16 +194,7 @@ def _parse_structured_output(raw: str) -> dict:
             if depth == 0:
                 end = i + 1
                 break
-    try:
-        parsed = json.loads(cleaned[start:end])
-        summary = parsed.get("recap", parsed.get("summary", ""))
-        facts = parsed.get("memories", parsed.get("facts", []))
-        topics = parsed.get("topics", [])
-        # `entities` are original-text terms (named objects, specific nouns,
-        # numbers, jargon) — they're what makes literal-keyword recall work
-        # later. `topics` stay as abstract tags. Both go into the FTS-indexed
-        # `keywords` field, with entities first so they dominate matching.
-        entities = parsed.get("entities", [])
+    def _build_keywords(entities, topics):
         if not isinstance(entities, list):
             entities = []
         seen = set()
@@ -216,11 +207,73 @@ def _parse_structured_output(raw: str) -> dict:
                 continue
             seen.add(w)
             merged.append(w)
-        keywords = ", ".join(merged)
+        return ", ".join(merged)
+
+    try:
+        parsed = json.loads(cleaned[start:end])
+        summary = parsed.get("recap", parsed.get("summary", ""))
+        facts = parsed.get("memories", parsed.get("facts", []))
+        topics = parsed.get("topics", [])
+        entities = parsed.get("entities", [])
+        if not isinstance(entities, list):
+            entities = []
+        keywords = _build_keywords(entities, topics)
         return {"summary": summary, "facts": facts, "topics": topics,
                 "entities": entities, "keywords": keywords}
     except (json.JSONDecodeError, TypeError):
+        # JSON likely got truncated mid-output (maxOutputTokens cap, network
+        # cut). Salvage as much as possible with regex — recap/entities/topics
+        # are usually still complete by the time the token budget runs out
+        # in the middle of memories[] or trailing JSON syntax.
+        salvage = _parse_truncated_json(cleaned[start:])
+        if salvage["summary"]:
+            entities = salvage.get("entities", [])
+            topics = salvage.get("topics", [])
+            keywords = _build_keywords(entities, topics)
+            return {
+                "summary": salvage["summary"],
+                "facts": salvage.get("facts", []),
+                "topics": topics,
+                "entities": entities,
+                "keywords": keywords,
+            }
         return _parse_legacy_output(raw)
+
+
+_RECAP_RE = re.compile(r'"recap"\s*:\s*"((?:[^"\\]|\\.)*)', re.DOTALL)
+_MEMORIES_RE = re.compile(r'"memories"\s*:\s*\[(.*?)(?:\]|$)', re.DOTALL)
+_TOPICS_RE = re.compile(r'"topics"\s*:\s*\[(.*?)(?:\]|$)', re.DOTALL)
+_ENTITIES_RE = re.compile(r'"entities"\s*:\s*\[(.*?)(?:\]|$)', re.DOTALL)
+_STR_ITEM_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
+
+
+def _parse_truncated_json(raw: str) -> dict:
+    """Pull recap/memories/topics/entities out of partial JSON.
+
+    LLM outputs often get cut off mid-array when maxOutputTokens runs out.
+    json.loads() then fails wholesale, and the chunker used to fall back
+    to dumping the raw text into the summary field — leaving a chunk whose
+    "summary" started with `{"recap":"...` and broke surfacing display.
+
+    This best-effort regex pass extracts each top-level field independently.
+    Missing/incomplete fields just come back empty rather than poisoning
+    the whole record.
+    """
+    out = {"summary": "", "facts": [], "topics": [], "entities": []}
+    m = _RECAP_RE.search(raw)
+    if m:
+        text = m.group(1).replace('\\"', '"').replace("\\\\", "\\").replace("\\n", "\n")
+        out["summary"] = text.strip()
+    m = _MEMORIES_RE.search(raw)
+    if m:
+        out["facts"] = [s.replace('\\"', '"') for s in _STR_ITEM_RE.findall(m.group(1))]
+    m = _TOPICS_RE.search(raw)
+    if m:
+        out["topics"] = [s.replace('\\"', '"') for s in _STR_ITEM_RE.findall(m.group(1))]
+    m = _ENTITIES_RE.search(raw)
+    if m:
+        out["entities"] = [s.replace('\\"', '"') for s in _STR_ITEM_RE.findall(m.group(1))]
+    return out
 
 
 def _parse_legacy_output(raw: str) -> dict:

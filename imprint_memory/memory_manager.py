@@ -2951,12 +2951,12 @@ def surfacing_search(query: str, limit: int = 3) -> str:
             continue
 
         if r["pool"] == "memory":
-            content = r.get("content", "")[:60]
+            content = (r.get("content", "") or "")[:150]
             ts = (r.get("created_at", "") or "")[:10]
             lines.append(f"[{mem_label}|{ts}] {content}")
 
         elif r["pool"] == "chunk":
-            summary = r.get("summary", r.get("content", ""))[:60]
+            summary = (r.get("summary", r.get("content", "")) or "")[:150]
             ts = (r.get("start_time", "") or "")[:10]
             lines.append(f"[{ts}] {summary}")
             expanded = r.get("expanded", [])
@@ -2969,12 +2969,12 @@ def surfacing_search(query: str, limit: int = 3) -> str:
                 hi = min(len(expanded), anchor_idx + 2)
                 for e in expanded[lo:hi]:
                     img = f" [📷 {e['image_path']}]" if e.get("image_path") else ""
-                    lines.append(f"  {e['speaker']}: {e['content'][:80]}{img}")
+                    lines.append(f"  {e['speaker']}: {e['content'][:150]}{img}")
             elif expanded:
-                lines.append(f"  {expanded[0]['speaker']}: {expanded[0]['content'][:80]}")
+                lines.append(f"  {expanded[0]['speaker']}: {expanded[0]['content'][:150]}")
 
         elif r["pool"] == "conversation":
-            content = _clean_msg_for_display(r.get("content", "") or "")[:60]
+            content = _clean_msg_for_display(r.get("content", "") or "")[:150]
             sp = r.get("speaker") or (USER_NAME if r.get("direction") == "in" else AGENT_NAME)
             ts = (r.get("created_at", "") or "")[:10]
             lines.append(f"[{conv_label}|{ts}] {sp}: {content}")
