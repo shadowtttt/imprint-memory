@@ -40,42 +40,55 @@ Claude: (recalls your allergy before suggesting a recipe)
 - **Speaks Chinese** — full CJK search, time expressions like
   `昨天`、`上个月`、`去年冬天`.
 
-## Capabilities — auto vs manual
+## How it actually works
 
-A common question: *"does the AI still have to choose to remember things?"*
+A common misconception: *"the AI still has to choose what to
+remember, right?"* — **No.** Every piece of the recall pipeline is
+automatic. The LLM never has to invoke `memory_remember` for things
+to be remembered. Curation tools exist (`memory_remember`, `pin`,
+`add_tags`, etc.) but they're *optional annotations* on top of an
+already-complete automatic system — search, recall, and
+auto-surfacing all work without any of them.
 
-**Short answer: no.** `memory_remember` (the LLM explicitly flagging a
-fact) is an **auxiliary, opt-in** mechanism — it is *not* required for
-the system to work. Even if `memory_remember` is never called once,
-every turn is still captured to the conversation log, chunked into
-events, embedded, indexed, and reachable via search. The LLM only
-invokes `memory_remember` when it judges a specific fact worth
-*highlighting* so it ranks higher in result lists — and even that's
-just a quality boost, not a load-bearing requirement.
+### Automatic pipeline (this is the whole system)
 
-Detail:
+| What | How |
+|---|---|
+| Every message stored verbatim | Channel adapters call `log_message()` on every in/out turn — Claude Code hook, claude.ai sync, Telegram bot, custom apps. No "decide to save" step. |
+| Multimodal embed of images | When a message carries an upload header (e.g. `路径=/abs/path.jpg`), `_maybe_embed_image` runs inline and writes a combined text+image vector |
+| Segment conversations into "events" | `incremental_chunk_update` runs on a schedule, groups consecutive messages into chunks, generates a one-paragraph LLM summary + keywords per chunk |
+| Top-K similarity graph between events | After each chunk batch, similarity edges are built so related events surface together in graph-mode retrieval |
+| Hybrid search across all pools | `memory_search` runs vector cosine + BM25 keyword + RRF rank-fusion across memory / bank / chunk pools every call |
+| Auto-surface relevant context on every prompt | A `UserPromptSubmit` hook calls `surfacing_search` before the LLM sees the prompt and injects a `<recall>` block with ~6 related events |
+| FTS5 + CJK indexing | SQLite triggers + `jieba` segmentation; index stays synced with every write |
+| Stopword auto-detection | `build_stopwords` discovers high-frequency low-information tokens nightly |
+| Embedding backfill | A launchd job catches anything missed (e.g. embed API was briefly down) |
 
-| What | Automatic? | How |
-|---|---|---|
-| Every message stored verbatim | ✓ Auto | Channel adapters call `log_message()` for every in/out turn — Claude Code hooks, claude.ai sync, Telegram bot, custom apps |
-| Multimodal embed of images | ✓ Auto | When a message carries an upload header (e.g. `路径=/abs/path.jpg`), `_maybe_embed_image` runs inline and writes a text+image vector |
-| Segment conversations into "events" | ✓ Auto | `incremental_chunk_update` runs on a schedule, groups consecutive messages into chunks, generates a one-paragraph LLM summary + keywords for each |
-| Top-K similarity graph between events | ✓ Auto | After each chunk batch, similarity edges are built so related events become reachable in graph-mode retrieval |
-| Hybrid search (semantic + FTS + RRF fusion) | ✓ Auto | `memory_search` runs vector cosine, BM25 keyword, and RRF rank-fusion across memory / bank / chunk pools every call |
-| Surface relevant context on each user prompt | ✓ Auto | A `UserPromptSubmit` hook calls `surfacing_search` before the LLM sees the prompt, injecting a `<recall>` block with up to ~6 related events |
-| FTS5 full-text index with CJK | ✓ Auto | SQLite triggers + `jieba` segmentation; index stays in sync with writes |
-| Auto-stopword detection | ✓ Auto | `build_stopwords` discovers high-frequency low-information tokens nightly |
-| Image / chunk embedding backfill | ✓ Auto | A launchd job catches anything that was missed (e.g. embedding API was down) |
-| Mark a fact worth highlighting *(auxiliary, optional)* | ⚡ AI calls | LLM invokes `memory_remember(content="I'm lactose intolerant")` when it judges something is a long-term fact worth quick access. **System still works fully without this — it's just a quality boost for fast lookup.** |
-| Pin a memory so it never decays | ⚡ AI / you | `memory_pin(id)` |
-| Tag / connect memories explicitly | ⚡ AI / you | `memory_add_tags`, `memory_add_edge` |
-| Bulk maintenance (find stale, decay, delete) | ⚡ You | `memory_find_stale`, `memory_decay`, `memory_delete` |
+**This is the whole system.** Even if you never touch the curation
+tools below, `memory_search` will find anything you've said or sent
+in any conversation, surface it on relevant prompts, and link related
+events together via the chunk graph.
 
-**Key idea**: even if the LLM never calls `memory_remember` once, every
-turn is still captured to `conversation_log`, chunked into events,
-embedded, indexed, and reachable via `memory_search`. `memory_remember`
-is just a way to flag specific facts for *fast* retrieval at the
-top of result lists, not the only way to remember.
+<details>
+<summary>Optional curation tools (the system works fully without any of these)</summary>
+
+These exist so the LLM (or you) can annotate memories for slightly
+higher-quality retrieval. **None of them are required.** Recall,
+search, and auto-surfacing all work without ever calling them.
+
+- `memory_remember(content)` — flag a *specific* fact as a "highlight"
+  so it ranks higher when relevant. Useful for ground-truth facts
+  ("I'm lactose intolerant") that you want pulled up reliably.
+- `memory_pin(id)` — pin a memory so it never time-decays.
+- `memory_add_tags(id, tags)`, `memory_add_edge(...)` — manual
+  taxonomy / relationship annotation.
+- `memory_find_stale`, `memory_decay`, `memory_delete` — bulk
+  maintenance of the curated set.
+
+If your LLM never calls any of these, you lose nothing structural —
+just the small ranking boost that an explicit "highlight" gives.
+
+</details>
 
 ## Quick Start
 
@@ -391,38 +404,51 @@ Claude: (推荐菜谱前自动回忆起你的过敏)
 - **中文友好** — 完整中文搜索，支持 `昨天`、`上个月`、`去年冬天`
   等时间表达。
 
-## 能力清单 — 自动 vs 手动
+## 真正的工作流程
 
-朋友常问："是不是还是要 AI 自己存记忆？"
+常见误解："是不是还是要 AI 自己决定要记什么？" —— **不是**。
+整个 recall 管线**全自动**。LLM **从来不需要**调 `memory_remember`，
+东西就已经被记下来了。整理工具（`memory_remember`、`pin`、
+`add_tags` 等）确实存在，但它们是**可选的标注层**，叠在一套已经
+完整运转的自动系统**之上** —— 搜索、召回、自动浮现都跟它们无关。
 
-**简答：不需要。**`memory_remember`（让 LLM 显式标记一条事实）是
-**辅助、可选**机制 —— 系统跑起来**不依赖**它。就算 LLM 从来不调一次，
-每个 turn 也都被自动写进对话日志、自动切成事件、自动 embed、自动建索引、
-能被搜到。LLM 只在判断某条具体事实值得"高亮"（在结果列表里更靠前）时
-才调 `memory_remember`，**这只是锦上添花，不是命脉**。
+### 自动管线（这就是整个系统）
 
-详情：
+| 能力 | 怎么做到 |
+|---|---|
+| 每条消息原文入库 | Channel adapter 在每个 in/out turn 都调 `log_message()` — Claude Code hook、claude.ai 同步、Telegram bot、自定义 app。**没有"要不要存"那一步**。 |
+| 图片多模态嵌入 | 消息带上传 header（如 `路径=/abs/path.jpg`）时，`_maybe_embed_image` 立即跑，写入 text+image 联合向量 |
+| 对话切分成"事件" | `incremental_chunk_update` 定时跑，把连续消息切成 chunk，用 LLM 生成一段摘要 + keywords |
+| 事件之间的 Top-K 相似度图谱 | 每批 chunk 切完后自动建相似度边，graph 检索时让相关事件链到一起 |
+| 全池混合搜索 | `memory_search` 每次调用都跑向量 cosine + BM25 关键词 + RRF rank 融合，覆盖 memory / bank / chunk 三池 |
+| 每次提问自动浮现相关上下文 | `UserPromptSubmit` hook 在 LLM 看到 prompt 前就调 `surfacing_search`，注入 `<recall>` 块（约 6 条相关事件） |
+| FTS5 全文索引 + 中文分词 | SQLite trigger + `jieba` 分词，索引随写入实时同步 |
+| 停用词自动识别 | `build_stopwords` 夜跑，识别高频低信息词 |
+| Embedding 补漏 | launchd 兜底 job 处理 API 偶发不可用造成的漏 embed |
 
-| 能力 | 自动？ | 怎么做到 |
-|---|---|---|
-| 每条消息原文入库 | ✓ 自动 | Channel adapter 每个 in/out turn 都调 `log_message()` — Claude Code hook、claude.ai 同步、Telegram bot、自定义 app |
-| 图片多模态嵌入 | ✓ 自动 | 消息带上传 header（如 `路径=/abs/path.jpg`）时，`_maybe_embed_image` 立即跑，写入 text+image 联合向量 |
-| 对话切分成"事件" | ✓ 自动 | `incremental_chunk_update` 定时跑，把连续消息切成 chunk，用 LLM 生成一段摘要 + keywords |
-| 事件之间的 Top-K 相似度图谱 | ✓ 自动 | 每批 chunk 切完后自动建相似度边，让相关事件在 graph 检索时能链到 |
-| 混合搜索（语义 + FTS + RRF 融合）| ✓ 自动 | `memory_search` 每次调用都跑向量 cosine、BM25 关键词、RRF rank 融合，覆盖 memory / bank / chunk 三池 |
-| 用户每次提问自动浮现相关上下文 | ✓ 自动 | `UserPromptSubmit` hook 在 LLM 看到 prompt 前就调 `surfacing_search`，注入 `<recall>` 块（约 6 条相关事件） |
-| FTS5 全文索引 + 中文分词 | ✓ 自动 | SQLite trigger + `jieba` 分词，索引随写入实时同步 |
-| 停用词自动识别 | ✓ 自动 | `build_stopwords` 夜跑，识别高频低信息词 |
-| 图片 / chunk embedding 补漏 | ✓ 自动 | launchd 兜底 job 处理 API 临时挂掉之类的漏 embed |
-| 标记一条"值得高亮"的事实 *(辅助、可选)* | ⚡ AI 调 | LLM 判断某事值得长期快查时调 `memory_remember(content="用户乳糖不耐受")`。**没有这步系统也照常工作 —— 只是少了"高亮快查"那点加成。** |
-| Pin 一条记忆使它不衰减 | ⚡ AI / 你 | `memory_pin(id)` |
-| 手动加标签 / 关系 | ⚡ AI / 你 | `memory_add_tags`、`memory_add_edge` |
-| 批量维护（找过时、衰减、删除）| ⚡ 你 | `memory_find_stale`、`memory_decay`、`memory_delete` |
+**这就是整个系统。**就算你**永远不碰**下面那些整理工具，
+`memory_search` 也能搜到你说过、发过的任何东西，在相关 prompt 上
+自动浮现，并通过 chunk 图谱把相关事件链到一起。
 
-**关键 idea**：就算 LLM 从来不调一次 `memory_remember`，每个 turn
-也都被自动捕获进 `conversation_log`，切成事件、做 embedding、建索引、
-能被 `memory_search` 搜到。`memory_remember` 只是给 LLM 标记某条事实
-"值得在结果列表里靠前出现"的方式——不是"记住"的唯一渠道。
+<details>
+<summary>可选整理工具（不调系统照常工作）</summary>
+
+这些工具让 LLM（或你）给记忆做**标注**，让检索质量稍微再好一点。
+**没有一项是必需的。**召回 / 搜索 / 自动浮现都不依赖它们。
+
+- `memory_remember(content)` — 把**特定**事实标成"高亮"，让它在相关
+  时排到结果列表更靠前。适合像"我乳糖不耐受"这种你希望可靠拉出来
+  的 ground-truth 事实。
+- `memory_pin(id)` — 钉住某条记忆使它永不时间衰减。
+- `memory_add_tags(id, tags)`、`memory_add_edge(...)` — 手动加分类
+  / 关系标注。
+- `memory_find_stale`、`memory_decay`、`memory_delete` — 批量维护
+  整理后的集合。
+
+如果你的 LLM 一次都不调这些，你**不会失去任何结构性能力** —— 只是
+少了"高亮事实排前面"那点微调 ranking。
+
+</details>
 
 ## 快速开始
 
