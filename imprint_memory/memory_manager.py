@@ -28,7 +28,14 @@ USER_NAME = os.environ.get("IMPRINT_USER_NAME", "User")
 AGENT_NAME = os.environ.get("IMPRINT_AGENT_NAME", "Assistant")
 
 # ─── Embedding Config ────────────────────────────────────
-EMBED_PROVIDER = os.environ.get("EMBED_PROVIDER", "ollama").lower()  # "ollama", "openai", or "google"
+# Default is "google" (gemini-embedding-2, 3072-dim, multimodal text+image).
+# Reason: the embed vector dimension MUST stay consistent across the lifetime
+# of a single DB — mixing 1024-dim (ollama bge-m3) and 3072-dim (google)
+# vectors makes cosine similarity return 0 across the boundary and the vec
+# search channel goes silently dark. Google's free tier covers normal use
+# without enabling billing; if you'd rather run fully offline, set
+# EMBED_PROVIDER=ollama BEFORE first write — and never switch later.
+EMBED_PROVIDER = os.environ.get("EMBED_PROVIDER", "google").lower()  # "ollama", "openai", "google", "cloudflare"
 
 # Ollama settings
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
@@ -55,7 +62,7 @@ _DEFAULT_MODELS = {
     "google": "gemini-embedding-2",
     "cloudflare": "@cf/baai/bge-large-en-v1.5",
 }
-EMBED_MODEL = os.environ.get("EMBED_MODEL", _DEFAULT_MODELS.get(EMBED_PROVIDER, "bge-m3"))
+EMBED_MODEL = os.environ.get("EMBED_MODEL", _DEFAULT_MODELS.get(EMBED_PROVIDER, "gemini-embedding-2"))
 
 BANK_INDEX_VERSION = 2
 
@@ -2247,7 +2254,15 @@ def _expand_chunk_hybrid(query: str, query_vec, results: list[dict], db, max_msg
                 display = _clean_msg_for_display(raw) or _THINK_RE.sub("", raw).strip()
                 speaker = m["speaker"] or (USER_NAME if m["direction"] == "in" else AGENT_NAME)
                 anchor_top.append((0.0, mid, speaker, display[:300], img_path))
-            top = [(s, i, sp, c, _extract_image_path(msg_by_id.get(i, {}).get("content") or ""))
+            # msg_by_id values are sqlite3.Row, not dict — they don't support
+            # .get(). Use direct indexing with a None-guard so a missing id
+            # falls through to no-image instead of AttributeError.
+            def _img_for(mid: int) -> str:
+                row = msg_by_id.get(mid)
+                if row is None:
+                    return ""
+                return _extract_image_path(row["content"] or "")
+            top = [(s, i, sp, c, _img_for(i))
                    for (s, i, sp, c) in non_anchor_top] + anchor_top
         else:
             top = [(s, i, sp, c, "") for (s, i, sp, c) in top]

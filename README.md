@@ -33,22 +33,31 @@ Claude: (recalls your allergy before suggesting a recipe)
 curl -fsSL https://raw.githubusercontent.com/Qizhan7/imprint-memory/main/scripts/setup.sh | bash
 ```
 
-Done. This installs everything: imprint-memory, local embeddings (Ollama + bge-m3), and registers the MCP server.
+Installs imprint-memory and registers the MCP server. You'll then need a
+`GOOGLE_API_KEY` for embeddings — see **[Models & Cost](#models--cost)**
+below (5-min, free, no card). Data lives in `~/.imprint/`.
 
 ### Manual install
 
 ```bash
 pip install imprint-memory
 claude mcp add -s user imprint-memory -- imprint-memory
+export GOOGLE_API_KEY=...          # for embeddings, see below
 ```
 
-Restart Claude Code. That's it. Data lives in `~/.imprint/`.
+Restart Claude Code. That's it.
 
-Want better search? Add local embeddings (free, runs on your machine):
+### Prefer fully-local (no API keys)?
+
+Set `EMBED_PROVIDER=ollama` BEFORE the first write, then:
 
 ```bash
 ollama pull bge-m3 && ollama serve
 ```
+
+You lose multimodal (text+image) — bge-m3 is text-only. See the
+[embedding consistency](#%EF%B8%8F-embedding-consistency--do-not-mix)
+note about *why this choice must be made up front*.
 
 ### Sync your claude.ai conversations (optional)
 
@@ -92,6 +101,65 @@ Add to `~/.claude/settings.json`:
   }
 }
 ```
+
+## Models & Cost
+
+imprint-memory uses three categories of model. The defaults all stay
+inside vendors' free tiers for normal personal use — **no payment card
+required, no billing to enable, no surprise charges**. You sign up for
+a free account, copy an API key, and you're done.
+
+### What's used by default
+
+| Purpose | Model | Provider | Cost |
+|---|---|---|---|
+| Embedding (text + image) | `gemini-embedding-2` (3072 dim) | Google AI Studio | Free tier (~1500 req/day) |
+| Chunk-summary LLM | `@cf/meta/llama-3.3-70b-instruct-fp8-fast` | Cloudflare Workers AI | Free tier (10k neurons/day) |
+| Context compression *(optional)* | `qwen3:8b` | Local Ollama | Local, no API |
+
+### Free-tier setup (5 min)
+
+1. **Google API key** — for embeddings:
+   - Visit https://aistudio.google.com/apikey
+   - Click "Create API key" (Google account is enough; no credit card,
+     no Cloud project required for AI Studio keys)
+   - Export it: `export GOOGLE_API_KEY=AIza...`
+
+2. **Cloudflare Workers AI** — for chunk summaries (optional but
+   recommended for the `chunker` pipeline):
+   - Sign up free at https://dash.cloudflare.com/sign-up (no card)
+   - Workers AI is free-tier enabled by default
+   - Account ID: visible in the dashboard URL
+   - API token: https://dash.cloudflare.com/profile/api-tokens →
+     "Create Token" → "Workers AI" template
+   - Export: `export CF_ACCOUNT_ID=...` and `export CF_API_TOKEN=...`
+
+3. **Ollama** — for the `compress.py` script (only if you use it):
+   - `brew install ollama && ollama pull qwen3:8b`
+
+For normal daily use, the free tiers are *not* close to running out.
+You only have to "enable" Workers AI in the dashboard (one click, no
+card) — same for Google AI Studio API access. Neither provider can
+charge you without you explicitly switching plans.
+
+### ⚠️ Embedding consistency — DO NOT MIX
+
+The vector dimension MUST stay constant across the lifetime of one DB.
+
+| Provider / model | Dim |
+|---|---|
+| Google `gemini-embedding-2` | **3072** |
+| Ollama `bge-m3` | **1024** |
+| OpenAI `text-embedding-3-small` | **1536** |
+
+Switching `EMBED_PROVIDER` mid-stream means new vectors get a different
+shape than old ones. Cosine similarity then returns 0 across the
+boundary and search silently goes half-blind — FTS still works, but
+the semantic channel is dead for everything written before the switch.
+
+**Pick once, before the first write.** If you absolutely must switch:
+drop `conversation_vectors` and `memory_vectors`, then re-embed
+everything with `imprint-memory-reindex`.
 
 ## MCP Tools (27 total)
 
@@ -182,7 +250,7 @@ All via environment variables. Defaults work out of the box for local use.
 | `IMPRINT_USER_NAME` | `User` | Your name in conversation summaries |
 | `IMPRINT_AGENT_NAME` | `Assistant` | AI name in conversation summaries |
 | `IMPRINT_LOCALE` | `en` | Output language: `en` or `zh` |
-| `EMBED_PROVIDER` | `ollama` | Embedding provider: `ollama`, `openai`, `google`, `cloudflare` |
+| `EMBED_PROVIDER` | `google` | Embedding provider: `google` (default, 3072-dim multimodal), `ollama` (1024-dim local), `openai`, `cloudflare`. **Pick once — see consistency warning above.** |
 | `EMBED_MODEL` | varies | Model for embeddings. Defaults: `bge-m3` (Ollama), `text-embedding-3-small` (OpenAI), `gemini-embedding-2` (Google) |
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama server URL |
 | `OPENAI_API_KEY` | unset | For OpenAI embeddings |
@@ -272,22 +340,30 @@ Claude: (推荐菜谱前自动回忆起你的过敏)
 curl -fsSL https://raw.githubusercontent.com/Qizhan7/imprint-memory/main/scripts/setup.sh | bash
 ```
 
-完事。自动装好 imprint-memory + 本地嵌入（Ollama + bge-m3）+ 注册 MCP。
+装好 imprint-memory + 注册 MCP。embedding 需要 `GOOGLE_API_KEY` ——
+看下面 **[模型与费用](#%E6%A8%A1%E5%9E%8B%E4%B8%8E%E8%B4%B9%E7%94%A8)** 章节（5 分钟搞定，全程免费，无需信用卡）。
+数据存在 `~/.imprint/`。
 
 ### 手动安装
 
 ```bash
 pip install imprint-memory
 claude mcp add -s user imprint-memory -- imprint-memory
+export GOOGLE_API_KEY=...          # 嵌入用，见下方
 ```
 
-重启 Claude Code 就能用。数据存在 `~/.imprint/`。
+重启 Claude Code 就能用。
 
-想要更好的搜索？加本地嵌入（免费，跑在你自己机器上）：
+### 想全本地不要 API key？
+
+**首次写入前**设 `EMBED_PROVIDER=ollama`，然后：
 
 ```bash
 ollama pull bge-m3 && ollama serve
 ```
+
+代价：失去多模态（文字+图片）—— bge-m3 只支持文字。看下面
+[嵌入维度一致性](#%E2%9A%A0%EF%B8%8F-%E5%B5%8C%E5%85%A5%E4%B8%80%E8%87%B4%E6%80%A7-%E7%BB%9D%E5%AF%B9%E4%B8%8D%E8%83%BD%E6%B7%B7%E7%94%A8) 警告，*这选择必须一开始就定下来*。
 
 ### 同步 claude.ai 对话（可选）
 
@@ -332,6 +408,61 @@ chmod +x ~/.claude/hooks/memory-check.sh
 ```
 
 中文输出设置：在 `~/.imprint/.env` 里加 `IMPRINT_LOCALE=zh` 和 `IMPRINT_HOOK_LANG=zh`。
+
+## 模型与费用
+
+imprint-memory 用到三类模型，默认全部走各厂商的**免费档**——
+**不需要绑卡、不需要开 billing、不会冒出账单**。注册免费账号、拿
+API key、配上就行。
+
+### 默认用什么
+
+| 用途 | 模型 | 厂商 | 费用 |
+|---|---|---|---|
+| 嵌入（文字+图片） | `gemini-embedding-2`（3072 维） | Google AI Studio | 免费档（约 1500 req/天） |
+| chunk 摘要 LLM | `@cf/meta/llama-3.3-70b-instruct-fp8-fast` | Cloudflare Workers AI | 免费档（10k neurons/天） |
+| 上下文压缩 *(可选)* | `qwen3:8b` | 本地 Ollama | 本地，不走 API |
+
+### 免费档配置（5 分钟）
+
+1. **Google API key** — 嵌入用：
+   - 打开 https://aistudio.google.com/apikey
+   - 点 "Create API key"（用 Google 账号就够，不要信用卡，
+     AI Studio key 不需要建 Cloud project）
+   - 导出环境变量：`export GOOGLE_API_KEY=AIza...`
+
+2. **Cloudflare Workers AI** — chunk 摘要用（可选，但跑 chunker
+   pipeline 推荐）：
+   - 免费注册 https://dash.cloudflare.com/sign-up（不要卡）
+   - Workers AI 默认免费档已开
+   - Account ID：dashboard 网址里能看到
+   - API token：https://dash.cloudflare.com/profile/api-tokens →
+     "Create Token" → 选 "Workers AI" 模板
+   - 导出：`export CF_ACCOUNT_ID=...` 和 `export CF_API_TOKEN=...`
+
+3. **Ollama** — 给 `compress.py` 脚本用（不用脚本就跳过）：
+   - `brew install ollama && ollama pull qwen3:8b`
+
+日常使用根本碰不到免费档上限。两边都只要"启用 / 注册"一下（点
+一下、不要卡），Google AI Studio 和 Cloudflare 都不可能在你没主
+动换套餐的情况下扣钱。
+
+### ⚠️ 嵌入一致性 — 绝对不能混用
+
+向量维度**必须**在同一个 DB 的整个生命周期里保持一致。
+
+| 厂商 / 模型 | 维度 |
+|---|---|
+| Google `gemini-embedding-2` | **3072** |
+| Ollama `bge-m3` | **1024** |
+| OpenAI `text-embedding-3-small` | **1536** |
+
+中途切 `EMBED_PROVIDER` = 新写入的 vec 跟旧的维度不一样。
+跨边界的 cosine sim 一律返回 0，搜索悄悄变瞎子——FTS 还能用，但
+语义通道对切换之前写入的所有数据都失效了。
+
+**写第一条之前就选好**。如果非得切：清掉 `conversation_vectors`
+和 `memory_vectors`，用 `imprint-memory-reindex` 全部重做。
 
 ## MCP 工具（共 27 个）
 
