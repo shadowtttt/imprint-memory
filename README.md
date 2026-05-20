@@ -43,14 +43,52 @@ Claude: (recalls your allergy before suggesting a recipe)
 ## How it actually works
 
 A common misconception: *"the AI still has to choose what to
-remember, right?"* — **No.** Every piece of the recall pipeline is
-automatic. The LLM never has to invoke `memory_remember` for things
-to be remembered. Curation tools exist (`memory_remember`, `pin`,
-`add_tags`, etc.) but they're *optional annotations* on top of an
-already-complete automatic system — search, recall, and
-auto-surfacing all work without any of them.
+remember, right?"* — **No.** The whole capture-and-recall pipeline
+is automatic. Curation tools (`memory_remember`, `pin`, etc.) exist
+and the LLM may use them for *small* quality boosts, but they sit
+on top of an already-complete automatic system. Search, recall, and
+auto-surfacing all work without any curation call ever being made.
 
-### Automatic pipeline (this is the whole system)
+### Architecture at a glance
+
+```mermaid
+flowchart TB
+    subgraph CAPTURE["📥 Capture (automatic, every turn)"]
+        turn["any conversation turn<br/>(cc hook · claude.ai sync · telegram · app)"]
+        turn --> log["log_message → conversation_log"]
+        log --> mm["multimodal embed<br/>(text + image)"]
+        log -. scheduled .-> ch["chunker → events + summaries"]
+        ch --> ce["chunk_edges<br/>(Top-K similarity graph)"]
+        log --> fts["FTS5 + jieba CJK index"]
+    end
+
+    subgraph SEARCH["🔎 Search (automatic, on every memory_search call)"]
+        q["query"] --> rrf["vec cosine + BM25 + RRF fusion"]
+        mm --- rrf
+        ce --- rrf
+        fts --- rrf
+        rrf --> ranked["ranked results across memory/bank/chunk pools"]
+    end
+
+    subgraph SURFACE["✨ Surface (automatic, before LLM sees any prompt)"]
+        prompt["user prompt"] --> hook["UserPromptSubmit hook"]
+        hook --> ssearch["surfacing_search"]
+        ssearch --> recall["⟨recall⟩ block injected<br/>≈ 6 related events"]
+    end
+
+    subgraph CURATE["📝 Curate (optional — LLM or you call. System works fully without these)"]
+        rem["memory_remember(content)<br/>flag highlight fact"]
+        pn["memory_pin(id)<br/>no decay"]
+        tg["memory_add_tags / add_edge<br/>manual annotation"]
+        mt["find_stale / decay / delete<br/>bulk maintenance"]
+    end
+
+    rem -. boost ranking .-> rrf
+    pn -. boost ranking .-> rrf
+    tg -. boost ranking .-> rrf
+```
+
+### Automatic pipeline — the whole system
 
 | What | How |
 |---|---|
@@ -64,31 +102,24 @@ auto-surfacing all work without any of them.
 | Stopword auto-detection | `build_stopwords` discovers high-frequency low-information tokens nightly |
 | Embedding backfill | A launchd job catches anything missed (e.g. embed API was briefly down) |
 
-**This is the whole system.** Even if you never touch the curation
-tools below, `memory_search` will find anything you've said or sent
-in any conversation, surface it on relevant prompts, and link related
-events together via the chunk graph.
+### Optional curation tools
 
-<details>
-<summary>Optional curation tools (the system works fully without any of these)</summary>
+The pipeline above is enough on its own. These extra MCP tools exist
+so the LLM (or you) can annotate memories for slightly better
+ranking — **call them when useful, skip them entirely if you don't
+care; the system works fully either way**.
 
-These exist so the LLM (or you) can annotate memories for slightly
-higher-quality retrieval. **None of them are required.** Recall,
-search, and auto-surfacing all work without ever calling them.
+| Tool | When | What it does |
+|---|---|---|
+| `memory_remember(content)` | LLM decides "this is a long-term ground-truth fact" | Stores it in the curated `memories` table so future searches surface it with a small ranking boost (e.g. `"I'm lactose intolerant"`) |
+| `memory_pin(id)` | A memory should never decay | Marks the row pinned — bypasses any importance/recency decay |
+| `memory_add_tags(id, tags)` / `memory_add_edge(src, dst, relation)` | Manual taxonomy / linking | Adds categorical tags or explicit relationships ("contradicts", "evolved from") between two memories |
+| `memory_find_stale`, `memory_decay`, `memory_delete` | Periodic clean-up | Inspect old/low-recall entries, decay importance scores, hard-delete rows you no longer want |
 
-- `memory_remember(content)` — flag a *specific* fact as a "highlight"
-  so it ranks higher when relevant. Useful for ground-truth facts
-  ("I'm lactose intolerant") that you want pulled up reliably.
-- `memory_pin(id)` — pin a memory so it never time-decays.
-- `memory_add_tags(id, tags)`, `memory_add_edge(...)` — manual
-  taxonomy / relationship annotation.
-- `memory_find_stale`, `memory_decay`, `memory_delete` — bulk
-  maintenance of the curated set.
-
-If your LLM never calls any of these, you lose nothing structural —
-just the small ranking boost that an explicit "highlight" gives.
-
-</details>
+If your LLM never invokes any of these, conversations are still
+captured, chunked, embedded, indexed, and reachable through
+`memory_search` — you just don't get the small "this fact is a
+highlight" ranking nudge.
 
 ## Quick Start
 
@@ -406,13 +437,52 @@ Claude: (推荐菜谱前自动回忆起你的过敏)
 
 ## 真正的工作流程
 
-常见误解："是不是还是要 AI 自己决定要记什么？" —— **不是**。
-整个 recall 管线**全自动**。LLM **从来不需要**调 `memory_remember`，
-东西就已经被记下来了。整理工具（`memory_remember`、`pin`、
-`add_tags` 等）确实存在，但它们是**可选的标注层**，叠在一套已经
-完整运转的自动系统**之上** —— 搜索、召回、自动浮现都跟它们无关。
+常见误解："是不是还是要 AI 自己决定要记什么？" —— **不是**。整个
+捕获-召回管线**全自动**。整理工具（`memory_remember`、`pin` 等）
+确实存在，LLM 可以**可选地**调用它们做小幅 ranking 微调，但它们
+叠在一套**已经完整运转的自动系统**之上。搜索、召回、自动浮现都
+不依赖整理工具调用，一次不调也照样跑。
 
-### 自动管线（这就是整个系统）
+### 架构总览
+
+```mermaid
+flowchart TB
+    subgraph CAPTURE["📥 捕获（自动，每个 turn）"]
+        turn["任何对话 turn<br/>(cc hook · claude.ai 同步 · telegram · app)"]
+        turn --> log["log_message → conversation_log"]
+        log --> mm["多模态 embed<br/>(text + image)"]
+        log -. 定时 .-> ch["chunker → 事件 + 摘要"]
+        ch --> ce["chunk_edges<br/>(Top-K 相似度图谱)"]
+        log --> fts["FTS5 + jieba 中文分词索引"]
+    end
+
+    subgraph SEARCH["🔎 搜索（自动，每次 memory_search 调用）"]
+        q["query"] --> rrf["向量 cosine + BM25 + RRF 融合"]
+        mm --- rrf
+        ce --- rrf
+        fts --- rrf
+        rrf --> ranked["memory / bank / chunk 三池排序结果"]
+    end
+
+    subgraph SURFACE["✨ 浮现（自动，LLM 看到 prompt 前）"]
+        prompt["user prompt"] --> hook["UserPromptSubmit hook"]
+        hook --> ssearch["surfacing_search"]
+        ssearch --> recall["⟨recall⟩ 块注入<br/>≈ 6 条相关事件"]
+    end
+
+    subgraph CURATE["📝 整理（可选 — LLM 或你调。不调系统照常工作）"]
+        rem["memory_remember(content)<br/>把事实标为高亮"]
+        pn["memory_pin(id)<br/>不衰减"]
+        tg["memory_add_tags / add_edge<br/>手动标注"]
+        mt["find_stale / decay / delete<br/>批量维护"]
+    end
+
+    rem -. ranking 微调 .-> rrf
+    pn -. ranking 微调 .-> rrf
+    tg -. ranking 微调 .-> rrf
+```
+
+### 自动管线 — 这就是整个系统
 
 | 能力 | 怎么做到 |
 |---|---|
@@ -426,29 +496,22 @@ Claude: (推荐菜谱前自动回忆起你的过敏)
 | 停用词自动识别 | `build_stopwords` 夜跑，识别高频低信息词 |
 | Embedding 补漏 | launchd 兜底 job 处理 API 偶发不可用造成的漏 embed |
 
-**这就是整个系统。**就算你**永远不碰**下面那些整理工具，
-`memory_search` 也能搜到你说过、发过的任何东西，在相关 prompt 上
-自动浮现，并通过 chunk 图谱把相关事件链到一起。
+### 可选整理工具
 
-<details>
-<summary>可选整理工具（不调系统照常工作）</summary>
+上面的自动管线已经够用。下面这些额外的 MCP 工具让 LLM（或你）给
+记忆做标注、做小幅 ranking 微调 — **想用就用、不想用全跳过都行，
+系统两种情况下都完整工作**。
 
-这些工具让 LLM（或你）给记忆做**标注**，让检索质量稍微再好一点。
-**没有一项是必需的。**召回 / 搜索 / 自动浮现都不依赖它们。
+| 工具 | 什么时候用 | 干啥 |
+|---|---|---|
+| `memory_remember(content)` | LLM 判断"这是长期 ground-truth 事实" | 存到 curated 的 `memories` 表，让以后相关搜索把它排得稍靠前（例如 `"我乳糖不耐受"`） |
+| `memory_pin(id)` | 这条不能衰减 | 标记为 pinned — 绕过所有重要度/衰减衰减 |
+| `memory_add_tags(id, tags)` / `memory_add_edge(src, dst, relation)` | 手动分类 / 加关系 | 加分类标签或两条记忆之间的显式关系（"矛盾"、"演化自" 之类） |
+| `memory_find_stale`、`memory_decay`、`memory_delete` | 定期清理 | 检查老/低召回 entries，衰减重要度，硬删不想要的行 |
 
-- `memory_remember(content)` — 把**特定**事实标成"高亮"，让它在相关
-  时排到结果列表更靠前。适合像"我乳糖不耐受"这种你希望可靠拉出来
-  的 ground-truth 事实。
-- `memory_pin(id)` — 钉住某条记忆使它永不时间衰减。
-- `memory_add_tags(id, tags)`、`memory_add_edge(...)` — 手动加分类
-  / 关系标注。
-- `memory_find_stale`、`memory_decay`、`memory_delete` — 批量维护
-  整理后的集合。
-
-如果你的 LLM 一次都不调这些，你**不会失去任何结构性能力** —— 只是
-少了"高亮事实排前面"那点微调 ranking。
-
-</details>
+LLM 一次都不调这些工具，对话也照常被捕获、切块、embed、建索引，
+能被 `memory_search` 搜到 —— 只是少了"这条是 highlight" 的那点
+ranking 微调。
 
 ## 快速开始
 
