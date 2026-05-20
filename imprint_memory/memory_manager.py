@@ -2186,35 +2186,24 @@ def _expand_chunk_hybrid(query: str, query_vec, results: list[dict], db, max_msg
             (sid, eid),
         ).fetchall()
 
-        use_embedding = query_vec and len(msgs) > 15
+        use_embedding = bool(query_vec)
 
         scored = []
         for m in msgs:
             raw = m["content"] or ""
-            # For scoring keep raw-but-think-stripped (so think text doesn't
-            # leak into keyword match), but the displayed snippet uses the
-            # full cleanup (channel-adapter brackets and 说: prefix removed).
             clean = _THINK_RE.sub("", raw).strip()
             if len(clean) < 5:
                 continue
             display = _clean_msg_for_display(raw) or clean
 
-            # Keyword score
             lower = clean.lower()
             kw_matched = sum(1 for t in term_set if t in lower)
             kw_score = kw_matched / len(term_set) if term_set else 0
 
-            # Density bonus: short messages with a direct keyword hit
-            # signal a concise topical line. "我要去拉屎了！" (7 chars hitting
-            # "拉屎") should beat a 200-char paragraph that mentions the term
-            # in passing. The 60-char threshold is generous so a short reply
-            # like "你看到马桶了吗？" still qualifies, while paragraph-length
-            # messages get their density boost capped to zero.
             density_bonus = 0.0
             if kw_matched > 0 and len(clean) < 60:
                 density_bonus = min(0.4, 0.6 * kw_matched / max(len(clean), 5))
 
-            # Embedding score (only for long chunks)
             emb_score = 0.0
             if use_embedding:
                 vrow = db.execute(
@@ -2225,7 +2214,6 @@ def _expand_chunk_hybrid(query: str, query_vec, results: list[dict], db, max_msg
                     vec = _blob_to_vec(vrow["embedding"])
                     emb_score = _cosine_similarity(query_vec, vec)
 
-            # Hybrid: embedding as base, keyword as boost, density on top
             if use_embedding:
                 score = emb_score + kw_score * 0.3 + density_bonus
             else:
@@ -2236,8 +2224,28 @@ def _expand_chunk_hybrid(query: str, query_vec, results: list[dict], db, max_msg
 
         scored.sort(key=lambda x: (-x[0], x[1]))
         top = [s for s in scored if s[0] > 0][:max_msgs]
+
         if not top:
-            top = scored[:max_msgs]
+            chunk_kws = set(
+                k.strip().lower()
+                for k in (r.get("keywords") or "").split(",")
+                if k.strip()
+            )
+            if chunk_kws:
+                rescored = []
+                msg_lookup = {m["id"]: m for m in msgs}
+                for sc, mid, sp, disp in scored:
+                    row = msg_lookup.get(mid)
+                    if row:
+                        lower = (row["content"] or "").lower()
+                        hits = sum(1 for t in chunk_kws if t in lower)
+                        rescored.append((hits, mid, sp, disp))
+                    else:
+                        rescored.append((0, mid, sp, disp))
+                rescored.sort(key=lambda x: (-x[0], x[1]))
+                top = [s for s in rescored if s[0] > 0][:max_msgs]
+            if not top:
+                top = scored[:max_msgs]
 
         # Image anchors: find any image-bearing msg inside the chunk and pin
         # it + its immediate predecessor and successor (as msg ids). Replaces
@@ -3299,14 +3307,29 @@ def _detect_intent(query: str, use_llm: bool = False) -> str | None:
     return None
 
 
-_INTENT_LLM_PROMPT = """判断这条搜索的意图类型。只输出一个词，不要解释。
+_INTENT_LLM_PROMPT = """这是一个对话记忆搜索系统。普通搜索用向量相似度就能回答（找到"像这个"的内容）。
+但有些问题向量搜索答不了——需要时间排序、因果追溯或全局概览。判断下面的搜索属于哪种。
 
-类型：
-- temporal_origin = 问最早/第一次/怎么开始/什么时候认识/起源
-- temporal_evolution = 问演进/变化/发展历程/怎么变成现在这样
-- causal = 问为什么/原因/因果
-- timeline = 问经历过什么/大事记/都做了什么/历史回顾
-- none = 普通搜索，不需要特殊处理
+只输出一个词。绝大多数搜索是 none。
+
+temporal_origin — 问"最初/一开始/怎么开始的/起源/从哪来的"，答案是最早的相关记录
+  ✓ "我们刚开始的时候" "最初怎么聊起来的" "故事从哪里开始" "回到最初"
+  ✗ "我们聊了什么"（不是问起源）"最近怎么样"（不是问最早）
+
+temporal_evolution — 问"怎么一步步变成现在这样/发展过程/变化轨迹"，答案是时间线上的变化
+  ✓ "这个功能怎么一步步做出来的" "从开始到现在经历了什么变化" "后来怎么样了"
+  ✗ "现在的状态是什么"（只问当前，不问变化）
+
+causal — 问"为什么/什么原因/是什么导致了"，答案是因果链
+  ✓ "背后的原因" "是什么让她做出这个选择" "导致这个结果的"
+  ✗ "她选了什么"（问事实，不问原因）
+
+timeline — 问"总体回顾/大事记/梳理时间线/都经历了什么"，答案是跨月份的全局概览
+  ✓ "回顾一下这一年" "梳理一下时间线" "总结聊过的话题"
+  ✗ "最近聊了什么"（只问近期，不是全局回顾）
+
+none — 普通搜索，向量相似度就够了。这是默认值，不确定就选 none。
+  ✓ "攀岩" "吃什么" "生日" "拉屎" "照片"
 
 搜索词：{query}
 意图："""
