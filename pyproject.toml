@@ -1,7 +1,7 @@
 [project]
 name = "imprint-memory"
 version = "0.1.0"
-description = "Persistent memory system for Claude Code — hybrid search (FTS5 + vector), message bus, task queue"
+description = "Automatic memory layer for any LLM agent — captures every conversation turn, multimodal embed (text+image), hybrid search (vec + FTS5 + RRF), auto-surfacing recall hook. MCP server (stdio + HTTP)."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"

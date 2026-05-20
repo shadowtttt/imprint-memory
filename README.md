@@ -17,13 +17,28 @@ Claude: (recalls your allergy before suggesting a recipe)
 
 ## What it does
 
-- **Remembers things** — facts, events, insights. You say it once, Claude knows it next time.
-- **Searches smart** — keyword + meaning combined. Ask "what did I say about that project last week?" and it finds it.
-- **Links memories together** — "this contradicts that", "this evolved from that". Claude sees the connections.
-- **Syncs your claude.ai chats** — optional Chrome extension captures your web conversations too.
-- **Auto-surfaces** — a hook can remind Claude of relevant memories before you even ask.
-- **Stays fresh** — old unused memories fade, important ones stay pinned. No endless pile-up.
-- **Speaks Chinese** — full CJK search, time expressions like `昨天`、`上个月`.
+- **Captures every turn automatically** — every message you send or
+  receive lands in a searchable log, gets segmented into events, and
+  gets multimodal-embedded (text + image). The LLM never needs to
+  "decide to remember" — it's already stored.
+- **Hybrid search out of the box** — keyword (FTS5/BM25) + semantic
+  (vector) + RRF rank fusion across memory / bank / chunk pools.
+  "What did I say about that project last week?" → it finds it.
+- **Auto-surfaces context before you even ask** — a
+  `UserPromptSubmit` hook calls `surfacing_search` on every prompt
+  and injects a `<recall>` block with up to ~6 related events.
+- **Multimodal** — images sent in a conversation get text + image
+  embeddings, so "the red screenshot I sent" lands on the right
+  message even if the caption doesn't mention "red".
+- **Syncs your claude.ai chats** — optional Chrome extension captures
+  your web conversations into the same memory store.
+- **AI-flagged highlights** *(optional)* — the LLM can call
+  `memory_remember` to bump a specific fact higher in search results,
+  but the system fully works without it.
+- **Stays organised** — facts can be pinned, tagged, and linked
+  (graph edges between memories). Importance can be tuned per-entry.
+- **Speaks Chinese** — full CJK search, time expressions like
+  `昨天`、`上个月`、`去年冬天`.
 
 ## Capabilities — auto vs manual
 
@@ -357,13 +372,24 @@ Claude: (推荐菜谱前自动回忆起你的过敏)
 
 ## 能做什么
 
-- **记东西** — 事实、事件、想法。说一次，下次 Claude 就知道。
-- **智能搜索** — 关键词 + 语义混合。问"上周说的那个项目是什么来着"也能找到。
-- **记忆关联** — "这个和那个矛盾"、"这个从那个演化来"。Claude 能看到记忆之间的联系。
-- **同步 claude.ai 对话** — 可选的 Chrome 扩展，把网页端聊天也收进来。
-- **自动浮现** — hook 能在你提问前就把相关记忆提醒给 Claude。
-- **保持新鲜** — 旧的没用的记忆会自动淡化，重要的可以钉住。不会越积越多。
-- **中文友好** — 完整中文搜索，支持 `昨天`、`上个月`、`去年冬天` 等时间表达。
+- **每个对话 turn 自动捕获** — 你发的、AI 回的每条消息都自动写入
+  可搜索的日志、自动切成事件、自动做多模态 embedding（文字 + 图片）。
+  LLM **不需要"决定要不要记住"**，写进 DB 是默认发生的。
+- **混合搜索开箱即用** — 关键词（FTS5/BM25）+ 语义（向量）+ RRF
+  rank 融合，覆盖 memory / bank / chunk 三池。问"上周那个项目是
+  什么来着"也能找到。
+- **提问前自动浮现相关上下文** — `UserPromptSubmit` hook 每次提问前
+  调 `surfacing_search`，注入 `<recall>` 块（约 6 条相关事件）。
+- **多模态** — 对话里发的图片会跟文字一起 embed，所以"我发的那张
+  红色截图"就算 caption 不提"红色"也能命中。
+- **同步 claude.ai 对话** — 可选 Chrome 扩展，把网页端聊天也存进
+  同一套记忆库。
+- **AI 主动标"高亮"** *(可选)* — LLM 可以调 `memory_remember` 把
+  某条事实顶到搜索结果靠前，但**系统跑起来不依赖这步**。
+- **可整理** — 记忆能 pin（不衰减）、加标签、加图谱边（记忆之间
+  的关系）。每条 importance 也可调。
+- **中文友好** — 完整中文搜索，支持 `昨天`、`上个月`、`去年冬天`
+  等时间表达。
 
 ## 能力清单 — 自动 vs 手动
 
