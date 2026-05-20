@@ -2122,13 +2122,27 @@ def _extract_image_path(content: str) -> str:
     return m.group(1).strip() if m else ""
 
 
+_CC_SYSTEM_RE = re.compile(
+    r"<(?:local-command-caveat|local-command-stdout|command-name|"
+    r"command-message|command-args|system-reminder|north-home|"
+    r"memory-check|recall)[^>]*>.*?</(?:local-command-caveat|"
+    r"local-command-stdout|command-name|command-message|command-args|"
+    r"system-reminder|north-home|memory-check|recall)>",
+    re.DOTALL,
+)
+_CC_COMPACT_PREFIX = "This session is being continued from a previous conversation"
+
+
 def _clean_msg_for_display(content: str) -> str:
     """Strip noise from a message before it's shown back to the user in a
-    surfacing snippet: <think> blocks, channel-adapter brackets, and a
-    leading "X 说:" lead-in. Returns the trimmed remainder."""
+    surfacing snippet: <think> blocks, CC system XML, channel-adapter
+    brackets, and a leading "X 说:" lead-in. Returns the trimmed remainder."""
     if not content:
         return ""
+    if content.lstrip().startswith(_CC_COMPACT_PREFIX):
+        return ""
     text = _THINK_RE.sub("", content)
+    text = _CC_SYSTEM_RE.sub("", text)
     for pat in _ADAPTER_PREFIX_RES:
         text = pat.sub("", text)
     text = re.sub(r"^\s*[\w]+说:\s*", "", text.strip())
@@ -2859,10 +2873,10 @@ def unified_search_text(
     _labels = {k: loc[k] for k in ("memory", "bank", "conversation")}
     lines: list[str] = []
     edge_lines: list[str] = []
-    # Dedup expanded messages by (speaker, text) across all chunk hits —
-    # repeated identical messages (same line sent 3-4 times) would
-    # otherwise flood the result page.
     seen_em_sigs: set[tuple[str, str]] = set()
+
+    top_score = max((r.get("score", 0) for r in results), default=0)
+    display_floor = max(top_score * 0.4, 0.15)
 
     for r in results:
         label = _labels.get(r["pool"], r["pool"])
@@ -2875,7 +2889,7 @@ def unified_search_text(
             edge_lines.append(f"[Memory|edge|{rel}] {content}")
             continue
 
-        if score <= 0:
+        if score <= 0 or score < display_floor:
             continue
 
         if r["pool"] == "memory":
@@ -2924,16 +2938,14 @@ def unified_search_text(
                 lines.append(f"━━ 原文 {chunk_ts}  (score {score:.2f}) ━━")
                 lines.extend(chunk_lines)
 
-    # Extra section: chunk graph expansion + memory edge expansion
-    extra = []
-    if "conversation" in (pools or ["memory", "bank", "conversation"]):
-        extra = _graph_expansion_section(query, results, limit=2)
-    extra.extend(edge_lines)
-
-    if extra:
+    # Extra section: intent-routed graph + memory edge expansion
+    graph = _intent_graph_section(query, results, limit=2)
+    if graph:
+        lines.extend(graph)
+    if edge_lines:
         lines.append("")
-        lines.append("--- 关联 ---")
-        lines.extend(extra)
+        lines.append("━━ 记忆关联 ━━")
+        lines.extend(f"    {el}" for el in edge_lines)
 
     return "\n".join(lines)
 
@@ -3244,124 +3256,364 @@ def surfacing_search(query: str, limit: int = 3) -> str:
     if not lines:
         return ""
 
-    graph = _graph_expansion_section(query, results, limit=2)
-    if graph:
-        lines.append(f"关联图谱：{graph[0]}")
+    graph_lines = _intent_graph_surfacing(query, results)
+    if graph_lines:
+        lines.extend(graph_lines)
 
     return "\n".join(lines)
 
 
 _GRAPH_EDGE_FLOOR = 0.75
 
+# ─── Intent-Routed Graph ────────────────────────────────
+# Default: graph section is empty. Only fires when query matches
+# a specific intent signal (origin / evolution / causal / timeline).
 
-def _graph_expansion_section(query: str, rrf_results: list[dict], limit: int = 5) -> list[str]:
-    """Generate graph-expansion section.
+_INTENT_CAUSAL = re.compile(
+    r"为什么|为啥|为何|因为.{0,30}所以"
+)
+_INTENT_TEMPORAL_ORIGIN = re.compile(
+    r"(?:怎么|什么时候).{0,2}(认识|遇见|碰上|开始|来到|找到我|在一起|相识)|"
+    r"最早|第一次|起源|从哪.{0,3}开始"
+)
+_INTENT_TEMPORAL_EVOLUTION = re.compile(
+    r"怎么(演进|演变|发展|变化|变成)|演进|演变|历程|过程"
+)
+_INTENT_TIMELINE = re.compile(
+    r"我们都.{0,3}(聊|做|经历|讨论|想)|经历过|历史|都聊了什么|大事"
+)
 
-    Hybrid retrieval (Zep/Graphiti style): seed chunks come from the
-    primary search; neighbours are pulled along chunk_edges, then
-    re-ranked by their own embedding cosine to the query so the graph
-    layer surfaces "events on the same arc that DO relate to the
-    query topic" — not just "anything strongly linked to the seed".
 
-    Pure edge-strength sorting (which is what a naive BFS gives you)
-    drags in chunks that happen to be temporally adjacent to the seed
-    but topically off (e.g. searching "拉屎" surfaces a chunk about
-    Tononi's integrated information theory just because they were
-    discussed the same day). Re-ranking by query similarity keeps the
-    graph honest.
+def _detect_intent(query: str, use_llm: bool = False) -> str | None:
+    """Regex fast path, optional CF LLM fallback for ambiguous queries."""
+    if _INTENT_CAUSAL.search(query):
+        return "causal"
+    if _INTENT_TEMPORAL_ORIGIN.search(query):
+        return "temporal_origin"
+    if _INTENT_TEMPORAL_EVOLUTION.search(query):
+        return "temporal_evolution"
+    if _INTENT_TIMELINE.search(query):
+        return "timeline"
+    if use_llm and _CF_ACCOUNT_ID and _CF_API_TOKEN:
+        return _detect_intent_llm(query)
+    return None
 
-    Near-duplicate cap (keyword overlap with seed > 70%) still
-    applies — that's dedup, not topic filtering."""
-    seen_ids = set()
-    seed_chunk_ids = []
+
+_INTENT_LLM_PROMPT = """判断这条搜索的意图类型。只输出一个词，不要解释。
+
+类型：
+- temporal_origin = 问最早/第一次/怎么开始/什么时候认识/起源
+- temporal_evolution = 问演进/变化/发展历程/怎么变成现在这样
+- causal = 问为什么/原因/因果
+- timeline = 问经历过什么/大事记/都做了什么/历史回顾
+- none = 普通搜索，不需要特殊处理
+
+搜索词：{query}
+意图："""
+
+_VALID_INTENTS = {"temporal_origin", "temporal_evolution", "causal", "timeline"}
+
+
+def _detect_intent_llm(query: str) -> str | None:
+    try:
+        url = (f"https://api.cloudflare.com/client/v4/accounts/{_CF_ACCOUNT_ID}"
+               f"/ai/run/{_CF_RERANK_MODEL}")
+        payload = json.dumps({"messages": [
+            {"role": "user", "content": _INTENT_LLM_PROMPT.format(query=query)},
+        ], "max_tokens": 20}).encode()
+        req = urllib.request.Request(
+            url, data=payload, method="POST",
+            headers={"Authorization": f"Bearer {_CF_API_TOKEN}",
+                     "Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read())
+        answer = (data.get("result", {}).get("response") or "").strip().lower()
+        for intent in _VALID_INTENTS:
+            if intent in answer:
+                return intent
+    except Exception:
+        pass
+    return None
+
+
+def _scored_all_chunks(query_vec: list[float], db, top_n: int = 30) -> list[dict]:
+    """Full-table vec scan of conversation_chunks via numpy batch matmul."""
+    import numpy as _np
+    rows = db.execute(
+        "SELECT id, start_time, end_time, start_msg_id, end_msg_id, "
+        "       msg_count, summary, keywords, embedding "
+        "FROM conversation_chunks WHERE embedding IS NOT NULL"
+    ).fetchall()
+    if not rows:
+        return []
+    dim = len(query_vec)
+    mat = _np.empty((len(rows), dim), dtype=_np.float32)
+    valid = _np.ones(len(rows), dtype=bool)
+    for i, r in enumerate(rows):
+        blob = r["embedding"]
+        if not blob or len(blob) // 4 != dim:
+            valid[i] = False
+            continue
+        mat[i] = _np.frombuffer(blob, dtype=_np.float32)
+    q = _np.asarray(query_vec, dtype=_np.float32)
+    row_norms = _np.linalg.norm(mat, axis=1)
+    q_norm = float(_np.linalg.norm(q)) or 1.0
+    sims = (mat @ q) / (row_norms * q_norm + 1e-8)
+    sims[~valid] = -1.0
+    sims[~_np.isfinite(sims)] = -1.0
+    order = _np.argsort(-sims)[:top_n]
+    return [
+        {
+            "id": rows[int(idx)]["id"],
+            "pool": "chunk",
+            "start_time": rows[int(idx)]["start_time"],
+            "end_time": rows[int(idx)]["end_time"],
+            "start_msg_id": rows[int(idx)]["start_msg_id"],
+            "end_msg_id": rows[int(idx)]["end_msg_id"],
+            "msg_count": rows[int(idx)]["msg_count"],
+            "summary": rows[int(idx)]["summary"],
+            "keywords": rows[int(idx)]["keywords"],
+            "vec_similarity": float(sims[int(idx)]),
+            "score": float(sims[int(idx)]),
+        }
+        for idx in order
+        if sims[int(idx)] > 0
+    ]
+
+
+def _temporal_origin_section(query: str, rrf_results: list[dict], db, limit: int = 2) -> list[str]:
+    """Earliest chunks topically related to query. Always full-scan —
+    rrf_results are biased by time decay and miss early chunks."""
+    qv = _embed(query)
+    if not qv:
+        return []
+    candidates = _scored_all_chunks(qv, db, top_n=30)
+    if not candidates:
+        return []
+    main_ids = {r.get("id") for r in rrf_results[:5] if r.get("pool") == "chunk"}
+    candidates = [c for c in candidates if c["id"] not in main_ids]
+    candidates.sort(key=lambda c: c.get("start_time") or "")
+    lines = []
+    for c in candidates[:limit]:
+        ts = (c.get("start_time") or "")[:10]
+        summary = " ".join((c.get("summary") or "").split())[:180]
+        lines.append(f"[Origin|{ts}] {summary}")
+    return lines
+
+
+def _temporal_evolution_section(query: str, rrf_results: list[dict], db, limit: int = 5) -> list[str]:
+    """Trace how a topic evolved over time via chunk_edges."""
+    seed_chunks = []
+    seen_ids: set[int] = set()
     for r in rrf_results:
-        if r.get("pool") == "chunk":
-            cid = r.get("id")
-            if cid:
-                seen_ids.add(cid)
-                seed_chunk_ids.append(cid)
-
-    if not seed_chunk_ids:
+        if r.get("pool") == "chunk" and r.get("id"):
+            seed_chunks.append(r)
+            seen_ids.add(r["id"])
+    if not seed_chunks:
         return []
 
-    seed_keywords = set()
-    db = _get_db()
-    try:
-        for sid in seed_chunk_ids:
-            row = db.execute("SELECT keywords FROM conversation_chunks WHERE id = ?", (sid,)).fetchone()
-            if row and row["keywords"]:
-                seed_keywords.update(k.strip().lower() for k in row["keywords"].split(",") if k.strip())
-    except Exception:
-        pass
-
-    # Query terms (post-stopword) for the keyword-boost rerank. Chunk
-    # embeddings are stored from a different embedder dim (3072) than the
-    # current one (1024), so vec-sim rerank is unusable until embeddings
-    # are rebuilt. Keyword overlap on the summary text is the cheap stand-in.
-    if _JIEBA_OK:
-        from jieba import cut
-        query_terms = filter_stopwords(
-            [w.strip().lower() for w in cut(query) if len(w.strip()) >= 2]
-        )
-    else:
-        query_terms = filter_stopwords(
-            [w.lower() for w in query.split() if len(w) >= 2]
-        )
-    query_terms_set = set(query_terms)
-
-    lines: list[str] = []
-    candidates = []  # (composite_score, target_id, summary, ts)
-    try:
-        for seed_id in seed_chunk_ids[:3]:
+    all_events: list[tuple] = []
+    for seed in seed_chunks[:3]:
+        sid = seed["id"]
+        st = seed.get("start_time") or ""
+        sm = seed.get("summary") or seed.get("content", "")
+        all_events.append((st, sid, sm, True))
+        try:
             neighbors = db.execute(
                 """SELECT ce.target_id, ce.similarity * ce.strength as edge_score,
-                          c.summary, c.keywords, c.start_time
+                          c.summary, c.start_time
                    FROM chunk_edges ce
                    JOIN conversation_chunks c ON c.id = ce.target_id
-                   WHERE ce.source_id = ? AND ce.target_id NOT IN ({})
-                     AND ce.similarity * ce.strength >= ?
-                   ORDER BY edge_score DESC LIMIT 10""".format(
-                    ",".join(str(i) for i in seen_ids) if seen_ids else "0"
-                ),
-                (seed_id, _GRAPH_EDGE_FLOOR),
+                   WHERE ce.source_id = ? AND ce.similarity * ce.strength >= ?
+                   ORDER BY edge_score DESC LIMIT 10""",
+                (sid, _GRAPH_EDGE_FLOOR),
             ).fetchall()
-
             for n in neighbors:
-                if n["target_id"] in seen_ids:
+                tid = n["target_id"]
+                if tid in seen_ids:
                     continue
+                seen_ids.add(tid)
+                all_events.append((n["start_time"] or "", tid, n["summary"] or "", False))
+        except Exception:
+            pass
 
-                n_kws = {k.strip().lower() for k in (n["keywords"] or "").split(",") if k.strip()}
-                if seed_keywords and n_kws:
-                    overlap = len(n_kws & seed_keywords) / max(len(n_kws), 1)
-                    if overlap > 0.7:
-                        continue
+    if len(all_events) < 2:
+        return []
 
-                # Keyword-boost rerank: count query terms that show up in
-                # the neighbour's summary. 0 hits gets the floor multiplier
-                # so a 0.8-edge, 0-keyword chunk still loses to a 0.6-edge,
-                # 2-keyword chunk. Stays as a soft boost not a hard cut —
-                # graph value is "things keyword search would miss".
-                summary_text = " ".join((n["summary"] or "").split())
-                hits = sum(1 for t in query_terms_set if t in summary_text.lower())
-                kw_boost = hits / max(len(query_terms_set), 1)
-                composite = float(n["edge_score"]) * (0.3 + 0.7 * kw_boost)
+    by_day: dict[str, tuple] = {}
+    for ev in all_events:
+        day = (ev[0] or "")[:10]
+        if not day:
+            continue
+        if day not in by_day or ev[3]:
+            by_day[day] = ev
+    events = sorted(by_day.values(), key=lambda e: e[0])
 
-                ts = (n["start_time"] or "")[:10]
-                candidates.append(
-                    (composite, n["target_id"], summary_text[:180], ts)
-                )
+    if len(events) < 2:
+        return []
 
-        # Global rerank, take top limit.
-        candidates.sort(key=lambda x: -x[0])
-        for composite, tid, summary, ts in candidates[:limit]:
-            seen_ids.add(tid)
-            lines.append(f"[Graph|{ts}] {summary}")
-    except Exception:
+    try:
+        first_ts = datetime.fromisoformat(events[0][0][:19])
+        last_ts = datetime.fromisoformat(events[-1][0][:19])
+        if (last_ts - first_ts).days < 14:
+            return []
+    except (ValueError, IndexError):
         pass
+
+    seed_idx = next((i for i, e in enumerate(events) if e[3]), 0)
+    lo = max(0, seed_idx - 2)
+    hi = min(len(events), seed_idx + 3)
+    window = events[lo:hi]
+
+    main_ids = {r.get("id") for r in rrf_results[:5] if r.get("pool") == "chunk"}
+    lines = []
+    for ts_str, cid, summary, is_seed in window:
+        if cid in main_ids:
+            continue
+        ts = ts_str[:10]
+        sm = " ".join(summary.split())[:120]
+        marker = " ★" if is_seed else ""
+        lines.append(f"[Evo|{ts}] {sm}{marker}")
+    return lines[:limit]
+
+
+def _causal_section(query: str, rrf_results: list[dict], db, limit: int = 3) -> list[str]:
+    """Light causal: topically related chunks sorted by time ASC.
+    Always full-scan — rrf_results with small limit dedup everything."""
+    qv = _embed(query)
+    if not qv:
+        return []
+    candidates = _scored_all_chunks(qv, db, top_n=20)
+    if not candidates:
+        return []
+    candidates.sort(key=lambda c: c.get("start_time") or "")
+    main_ids = {r.get("id") for r in rrf_results[:5] if r.get("pool") == "chunk"}
+    lines = []
+    for c in candidates:
+        if c.get("id") in main_ids:
+            continue
+        ts = (c.get("start_time") or "")[:10]
+        summary = " ".join((c.get("summary") or "").split())[:180]
+        lines.append(f"[Causal|{ts}] {summary}")
+        if len(lines) >= limit:
+            break
+    return lines
+
+
+def _timeline_section(query: str, rrf_results: list[dict], db, limit: int = 5) -> list[str]:
+    """Month-sampled event overview. Full-scan to avoid small-limit dedup trap."""
+    qv = _embed(query)
+    if not qv:
+        return []
+    candidates = _scored_all_chunks(qv, db, top_n=50)
+    if not candidates:
+        return []
+    by_month: dict[str, dict] = {}
+    for c in candidates:
+        ts = (c.get("start_time") or "")[:7]
+        if not ts:
+            continue
+        if ts not in by_month or (c.get("score", 0) > by_month[ts].get("score", 0)):
+            by_month[ts] = c
+    picked = sorted(by_month.values(), key=lambda r: r.get("start_time") or "")
+    main_ids = {r.get("id") for r in rrf_results[:5] if r.get("pool") == "chunk"}
+    lines = []
+    for c in picked:
+        if c.get("id") in main_ids:
+            continue
+        ts = (c.get("start_time") or "")[:7]
+        summary = " ".join((c.get("summary") or "").split())[:120]
+        lines.append(f"[Timeline|{ts}] {summary}")
+        if len(lines) >= limit:
+            break
+    return lines
+
+
+_INTENT_BANNERS = {
+    "temporal_origin": "━━ 最早的相关对话 ━━",
+    "temporal_evolution": "━━ 演进时间线 ━━",
+    "causal": "━━ 相关事件链 ━━",
+    "timeline": "━━ 大事记 ━━",
+}
+_INTENT_BANNERS_SHORT = {
+    "temporal_origin": "最早的相关：",
+    "temporal_evolution": "演进：",
+    "causal": "相关事件：",
+    "timeline": "大事记：",
+}
+
+
+def _format_graph_lines(raw_lines: list[str]) -> list[str]:
+    """Strip [Type|ts] prefix, return clean '  ts  summary' lines."""
+    out = []
+    for line in raw_lines:
+        if line.startswith("[") and "] " in line:
+            tag = line[1:line.index("]")]
+            ts = tag.split("|", 1)[1] if "|" in tag else ""
+            text = line[line.index("] ") + 2:]
+            out.append(f"    {ts}  {text}")
+        else:
+            out.append(f"    {line}")
+    return out
+
+
+def _intent_graph_section(query: str, rrf_results: list[dict], limit: int = 2) -> list[str]:
+    """Entry point replacing _graph_expansion_section. Routes by intent.
+    Uses LLM fallback for ambiguous queries (regex miss → ask CF)."""
+    intent = _detect_intent(query, use_llm=True)
+    if not intent:
+        return []
+    db = _get_db()
+    try:
+        if intent == "temporal_origin":
+            raw = _temporal_origin_section(query, rrf_results, db, limit=limit)
+        elif intent == "temporal_evolution":
+            raw = _temporal_evolution_section(query, rrf_results, db, limit=limit + 3)
+        elif intent == "causal":
+            raw = _causal_section(query, rrf_results, db, limit=limit + 1)
+        elif intent == "timeline":
+            raw = _timeline_section(query, rrf_results, db, limit=limit + 3)
+        else:
+            raw = []
+        if not raw:
+            return []
+        lines = ["", _INTENT_BANNERS[intent]]
+        lines.extend(_format_graph_lines(raw))
+        return lines
+    except Exception:
+        return []
     finally:
         db.close()
 
-    return lines
+
+def _intent_graph_surfacing(query: str, rrf_results: list[dict]) -> list[str]:
+    """Compact intent-routed graph for surfacing (~400 char budget)."""
+    intent = _detect_intent(query)
+    if not intent:
+        return []
+    db = _get_db()
+    try:
+        if intent == "temporal_origin":
+            raw = _temporal_origin_section(query, rrf_results, db, limit=2)
+        elif intent == "temporal_evolution":
+            raw = _temporal_evolution_section(query, rrf_results, db, limit=4)
+        elif intent == "causal":
+            raw = _causal_section(query, rrf_results, db, limit=3)
+        elif intent == "timeline":
+            raw = _timeline_section(query, rrf_results, db, limit=4)
+        else:
+            raw = []
+        if not raw:
+            return []
+        lines = [_INTENT_BANNERS_SHORT[intent]]
+        for line in _format_graph_lines(raw):
+            lines.append(line.strip()[:80])
+        return lines
+    except Exception:
+        return []
+    finally:
+        db.close()
 
 
 # ═══════════════════════════════════════════════════════════════
