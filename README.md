@@ -28,9 +28,17 @@ Claude: (recalls your allergy before suggesting a recipe)
 ## Capabilities — auto vs manual
 
 A common question: *"does the AI still have to choose to remember things?"*
-The short answer is **no, the bulk of capture and recall is automatic** —
-the LLM only intervenes to mark a *highlight* fact as worth special
-treatment. Detail:
+
+**Short answer: no.** `memory_remember` (the LLM explicitly flagging a
+fact) is an **auxiliary, opt-in** mechanism — it is *not* required for
+the system to work. Even if `memory_remember` is never called once,
+every turn is still captured to the conversation log, chunked into
+events, embedded, indexed, and reachable via search. The LLM only
+invokes `memory_remember` when it judges a specific fact worth
+*highlighting* so it ranks higher in result lists — and even that's
+just a quality boost, not a load-bearing requirement.
+
+Detail:
 
 | What | Automatic? | How |
 |---|---|---|
@@ -43,7 +51,7 @@ treatment. Detail:
 | FTS5 full-text index with CJK | ✓ Auto | SQLite triggers + `jieba` segmentation; index stays in sync with writes |
 | Auto-stopword detection | ✓ Auto | `build_stopwords` discovers high-frequency low-information tokens nightly |
 | Image / chunk embedding backfill | ✓ Auto | A launchd job catches anything that was missed (e.g. embedding API was down) |
-| Mark a fact worth highlighting | ⚡ AI calls | LLM invokes `memory_remember(content="I'm lactose intolerant")` when it judges something is a long-term fact worth quick access |
+| Mark a fact worth highlighting *(auxiliary, optional)* | ⚡ AI calls | LLM invokes `memory_remember(content="I'm lactose intolerant")` when it judges something is a long-term fact worth quick access. **System still works fully without this — it's just a quality boost for fast lookup.** |
 | Pin a memory so it never decays | ⚡ AI / you | `memory_pin(id)` |
 | Tag / connect memories explicitly | ⚡ AI / you | `memory_add_tags`, `memory_add_edge` |
 | Bulk maintenance (find stale, decay, delete) | ⚡ You | `memory_find_stale`, `memory_decay`, `memory_delete` |
@@ -359,8 +367,15 @@ Claude: (推荐菜谱前自动回忆起你的过敏)
 
 ## 能力清单 — 自动 vs 手动
 
-朋友常问："是不是还是要 AI 自己存记忆？" 答案是**绝大部分是自动的**，
-LLM 只在某条信息值得"高亮"时才出手。详情：
+朋友常问："是不是还是要 AI 自己存记忆？"
+
+**简答：不需要。**`memory_remember`（让 LLM 显式标记一条事实）是
+**辅助、可选**机制 —— 系统跑起来**不依赖**它。就算 LLM 从来不调一次，
+每个 turn 也都被自动写进对话日志、自动切成事件、自动 embed、自动建索引、
+能被搜到。LLM 只在判断某条具体事实值得"高亮"（在结果列表里更靠前）时
+才调 `memory_remember`，**这只是锦上添花，不是命脉**。
+
+详情：
 
 | 能力 | 自动？ | 怎么做到 |
 |---|---|---|
@@ -373,7 +388,7 @@ LLM 只在某条信息值得"高亮"时才出手。详情：
 | FTS5 全文索引 + 中文分词 | ✓ 自动 | SQLite trigger + `jieba` 分词，索引随写入实时同步 |
 | 停用词自动识别 | ✓ 自动 | `build_stopwords` 夜跑，识别高频低信息词 |
 | 图片 / chunk embedding 补漏 | ✓ 自动 | launchd 兜底 job 处理 API 临时挂掉之类的漏 embed |
-| 标记一条"值得高亮"的事实 | ⚡ AI 调 | LLM 判断某事值得长期快查时调 `memory_remember(content="用户乳糖不耐受")` |
+| 标记一条"值得高亮"的事实 *(辅助、可选)* | ⚡ AI 调 | LLM 判断某事值得长期快查时调 `memory_remember(content="用户乳糖不耐受")`。**没有这步系统也照常工作 —— 只是少了"高亮快查"那点加成。** |
 | Pin 一条记忆使它不衰减 | ⚡ AI / 你 | `memory_pin(id)` |
 | 手动加标签 / 关系 | ⚡ AI / 你 | `memory_add_tags`、`memory_add_edge` |
 | 批量维护（找过时、衰减、删除）| ⚡ 你 | `memory_find_stale`、`memory_decay`、`memory_delete` |
