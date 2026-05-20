@@ -133,53 +133,49 @@ Add to `~/.claude/settings.json`:
 
 ## Models & Cost
 
-imprint-memory uses three categories of model. The defaults all stay
-inside vendors' free tiers for normal personal use — **no payment card
-required, no billing to enable, no surprise charges**. You sign up for
-a free account, copy an API key, and you're done.
+**imprint-memory does NOT replace your main chat model** — Claude /
+ChatGPT / Gemini / whichever LLM you talk to keeps doing that job
+unchanged. What imprint-memory runs internally is a small handful of
+**helper models** that turn raw chat history into searchable memory:
+one for *embedding* (turning text and images into vectors), one for
+*chunk summarization* (the chunker's LLM that compresses each
+conversation segment into a one-paragraph summary), and an optional
+one for *context compression*. The helpers below are all that
+imprint-memory itself calls — your main chat LLM and your API bill
+for it are completely separate.
 
-### What's used by default
+Default helper config is tuned to **fit inside vendors' free tiers
+for normal personal use** — no payment card required, no billing to
+enable, no surprise charges.
 
-| Purpose | Model | Provider | Cost |
-|---|---|---|---|
-| Embedding (text + image) | `gemini-embedding-2` (3072 dim) | Google AI Studio | Free tier (~1500 req/day) |
-| Chunk-summary LLM | `@cf/meta/llama-3.3-70b-instruct-fp8-fast` | Cloudflare Workers AI | Free tier (10k neurons/day) |
-| Context compression *(optional)* | `qwen3:8b` | Local Ollama | Local, no API |
+### Helper models (what imprint-memory actually calls)
 
-### Free-tier setup (5 min)
+| Helper | Required? | Default | Provider | Cost on default | How to get it |
+|---|---|---|---|---|---|
+| **Embedding** (text + image → vector) | **Required** | `gemini-embedding-2` (3072 dim, multimodal) | Google AI Studio | Free tier (~1500 req/day) | Sign up free at [aistudio.google.com](https://aistudio.google.com/apikey) → "Create API key" (Google account is enough; no credit card, no Cloud project). `export GOOGLE_API_KEY=...` |
+| Embedding (alternative 1) | — | `bge-m3` (1024 dim, **text only, no image**) | Local Ollama | $0, local | `brew install ollama && ollama pull bge-m3 && ollama serve` |
+| Embedding (alternative 2) | — | `text-embedding-3-small` (1536 dim, text only) | OpenAI | Paid, no free tier | Buy API credits, `export OPENAI_API_KEY=...` |
+| **Chunk-summary LLM** (chunker's LLM) | Optional but recommended | `@cf/meta/llama-3.3-70b-instruct-fp8-fast` | Cloudflare Workers AI | Free tier (10k neurons/day) | Sign up free at [dash.cloudflare.com/sign-up](https://dash.cloudflare.com/sign-up) (no card). Workers AI free tier is on by default. Account ID is in the dashboard URL. Create a token at [/profile/api-tokens](https://dash.cloudflare.com/profile/api-tokens) → "Create Token" → "Workers AI" template. `export CF_ACCOUNT_ID=... CF_API_TOKEN=...` |
+| Chunk-summary LLM (alternative 1) | — | `gemini-1.5-flash` or `gemini-2.0-flash` | Google AI Studio | Free tier (~15 req/min) | Same `GOOGLE_API_KEY` as embedding. Set `CF_SUMMARY_MODEL` to the Gemini model name |
+| Chunk-summary LLM (alternative 2) | — | Any Ollama model | Local Ollama | $0, local | Slower / lower quality summaries; set `CF_SUMMARY_MODEL` accordingly |
+| **Context compression** (`compress.py`) | Optional, separate script | `qwen3:8b` | Local Ollama | $0, local | Only if you actually use the `compress.py` CLI. `brew install ollama && ollama pull qwen3:8b` |
 
-1. **Google API key** — for embeddings:
-   - Visit https://aistudio.google.com/apikey
-   - Click "Create API key" (Google account is enough; no credit card,
-     no Cloud project required for AI Studio keys)
-   - Export it: `export GOOGLE_API_KEY=AIza...`
-
-2. **Cloudflare Workers AI** — for chunk summaries (optional but
-   recommended for the `chunker` pipeline):
-   - Sign up free at https://dash.cloudflare.com/sign-up (no card)
-   - Workers AI is free-tier enabled by default
-   - Account ID: visible in the dashboard URL
-   - API token: https://dash.cloudflare.com/profile/api-tokens →
-     "Create Token" → "Workers AI" template
-   - Export: `export CF_ACCOUNT_ID=...` and `export CF_API_TOKEN=...`
-
-3. **Ollama** — for the `compress.py` script (only if you use it):
-   - `brew install ollama && ollama pull qwen3:8b`
-
-For normal daily use, the free tiers are *not* close to running out.
-You only have to "enable" Workers AI in the dashboard (one click, no
-card) — same for Google AI Studio API access. Neither provider can
-charge you without you explicitly switching plans.
+**Bottom line**: the *only* thing strictly required to get up and running
+is **one** embedding provider. If you set up Google for embedding,
+chunk summarization can reuse the same `GOOGLE_API_KEY`. Daily personal
+use never gets close to free-tier limits, and "enabling" Workers AI
+or Google AI Studio is a single click — neither provider can charge
+you without you explicitly switching plans.
 
 ### ⚠️ Embedding consistency — DO NOT MIX
 
 The vector dimension MUST stay constant across the lifetime of one DB.
 
-| Provider / model | Dim |
-|---|---|
-| Google `gemini-embedding-2` | **3072** |
-| Ollama `bge-m3` | **1024** |
-| OpenAI `text-embedding-3-small` | **1536** |
+| Provider / model | Dim | Multimodal? |
+|---|---|---|
+| Google `gemini-embedding-2` | **3072** | ✓ text + image |
+| OpenAI `text-embedding-3-small` | **1536** | text only |
+| Ollama `bge-m3` | **1024** | text only |
 
 Switching `EMBED_PROVIDER` mid-stream means new vectors get a different
 shape than old ones. Cosine similarity then returns 0 across the
@@ -466,41 +462,33 @@ chmod +x ~/.claude/hooks/memory-check.sh
 
 ## 模型与费用
 
-imprint-memory 用到三类模型，默认全部走各厂商的**免费档**——
-**不需要绑卡、不需要开 billing、不会冒出账单**。注册免费账号、拿
-API key、配上就行。
+**imprint-memory 不取代你的主对话模型** —— 你日常聊天用的 Claude /
+ChatGPT / Gemini 还是它自己干活。imprint-memory 内部跑的是几个
+**辅助模型**，把对话历史转成可搜索的记忆：一个负责**嵌入**（把文字
+和图片转成向量）、一个负责 **chunk 摘要**（chunker 用 LLM 把每段对话
+压成一段总结）、还有一个可选的**上下文压缩**。下面列的就是
+imprint-memory 自己会调用的全部模型 —— 你的主对话 LLM 和它的 API
+账单跟这里**完全无关**。
 
-### 默认用什么
+默认配置都调成**塞进各厂商免费档**的水位 —— 不需要绑卡、不需要开
+billing、不会冒出账单。
 
-| 用途 | 模型 | 厂商 | 费用 |
-|---|---|---|---|
-| 嵌入（文字+图片） | `gemini-embedding-2`（3072 维） | Google AI Studio | 免费档（约 1500 req/天） |
-| chunk 摘要 LLM | `@cf/meta/llama-3.3-70b-instruct-fp8-fast` | Cloudflare Workers AI | 免费档（10k neurons/天） |
-| 上下文压缩 *(可选)* | `qwen3:8b` | 本地 Ollama | 本地，不走 API |
+### 辅助模型清单（imprint-memory 真正调的）
 
-### 免费档配置（5 分钟）
+| 辅助模型 | 必需？ | 默认 | 厂商 | 默认配置费用 | 怎么拿 |
+|---|---|---|---|---|---|
+| **嵌入**（文字+图片 → 向量） | **必需** | `gemini-embedding-2`（3072 维，多模态） | Google AI Studio | 免费档（约 1500 req/天） | 免费注册 [aistudio.google.com](https://aistudio.google.com/apikey) → "Create API key"（Google 账号就够，**不需要信用卡、不需要建 Cloud project**）。`export GOOGLE_API_KEY=...` |
+| 嵌入（替代项 1） | — | `bge-m3`（1024 维，**只支持文字、不支持图片**） | 本地 Ollama | $0，本地 | `brew install ollama && ollama pull bge-m3 && ollama serve` |
+| 嵌入（替代项 2） | — | `text-embedding-3-small`（1536 维，只支持文字） | OpenAI | 付费，无免费档 | 充值 API 余额，`export OPENAI_API_KEY=...` |
+| **Chunk 摘要 LLM** | 可选但推荐 | `@cf/meta/llama-3.3-70b-instruct-fp8-fast` | Cloudflare Workers AI | 免费档（10k neurons/天） | 免费注册 [dash.cloudflare.com/sign-up](https://dash.cloudflare.com/sign-up)（**不要卡**）。Workers AI 默认免费档开着。Account ID 在 dashboard 网址里能看到。在 [/profile/api-tokens](https://dash.cloudflare.com/profile/api-tokens) → "Create Token" → 选 "Workers AI" 模板创建 token。`export CF_ACCOUNT_ID=... CF_API_TOKEN=...` |
+| Chunk 摘要 LLM（替代项 1） | — | `gemini-1.5-flash` / `gemini-2.0-flash` | Google AI Studio | 免费档（约 15 req/分钟） | 复用嵌入那把 `GOOGLE_API_KEY`，设 `CF_SUMMARY_MODEL` 为 Gemini 模型名 |
+| Chunk 摘要 LLM（替代项 2） | — | 任意 Ollama 模型 | 本地 Ollama | $0，本地 | 摘要质量稍低、速度稍慢；设对应 `CF_SUMMARY_MODEL` |
+| **上下文压缩**（`compress.py` 用） | 可选，单独脚本 | `qwen3:8b` | 本地 Ollama | $0，本地 | 仅当你用 `compress.py` CLI 时才装。`brew install ollama && ollama pull qwen3:8b` |
 
-1. **Google API key** — 嵌入用：
-   - 打开 https://aistudio.google.com/apikey
-   - 点 "Create API key"（用 Google 账号就够，不要信用卡，
-     AI Studio key 不需要建 Cloud project）
-   - 导出环境变量：`export GOOGLE_API_KEY=AIza...`
-
-2. **Cloudflare Workers AI** — chunk 摘要用（可选，但跑 chunker
-   pipeline 推荐）：
-   - 免费注册 https://dash.cloudflare.com/sign-up（不要卡）
-   - Workers AI 默认免费档已开
-   - Account ID：dashboard 网址里能看到
-   - API token：https://dash.cloudflare.com/profile/api-tokens →
-     "Create Token" → 选 "Workers AI" 模板
-   - 导出：`export CF_ACCOUNT_ID=...` 和 `export CF_API_TOKEN=...`
-
-3. **Ollama** — 给 `compress.py` 脚本用（不用脚本就跳过）：
-   - `brew install ollama && ollama pull qwen3:8b`
-
-日常使用根本碰不到免费档上限。两边都只要"启用 / 注册"一下（点
-一下、不要卡），Google AI Studio 和 Cloudflare 都不可能在你没主
-动换套餐的情况下扣钱。
+**底线**：开起来**绝对必需的**只有**一个**嵌入服务。如果你用了
+Google 做嵌入，chunk 摘要可以直接复用同一把 `GOOGLE_API_KEY`。日常
+个人使用根本碰不到免费档上限，"启用" Workers AI 或 Google AI Studio
+都是点一下（**不要卡**），两边都不可能在你没主动换套餐的情况下扣钱。
 
 ### ⚠️ 嵌入一致性 — 绝对不能混用
 
