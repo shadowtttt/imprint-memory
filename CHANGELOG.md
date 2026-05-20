@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.1 — 2026-05-20
+
+Docs-only release that gets the new architecture diagram + restructured
+"How it actually works" section into the PyPI-shipped README. No code
+changes since 0.2.0.
+
+- Added mermaid architecture diagram with four flows: 📥 Capture,
+  🔎 Search, ✨ Surface (all automatic), and 📝 Curate (optional,
+  dotted arrows).
+- "Optional curation tools" restored as a visible second table next
+  to the automatic pipeline table — no longer hidden in a `<details>`
+  block. The framing makes auxiliary vs. core unmissable while still
+  letting power users see the tools at a glance.
+- Bilingual (EN + ZH) sections kept parallel.
+
 ## 0.2.0 — 2026-05-20
 
 ### Default change (read this first)
