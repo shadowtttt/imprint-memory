@@ -2908,14 +2908,15 @@ def unified_search_text(
         if score <= 0 or score < pool_floor:
             continue
 
-        # Filter system guides from bank results — they match on example
-        # code snippets in documentation, not actual content.
+        # Filter system manuals from bank results — they match on example
+        # code snippets (e.g. `memory_search(query="攀岩")`) and are never
+        # what the user is looking for.
         if r["pool"] == "bank" and "guide" in (r.get("source", "") or ""):
             continue
 
-        # For memory/bank without keyword overlap in the first 150 chars,
+        # For memory/bank: if no query keyword appears in the content,
         # require strong semantic signal (vec_sim > 0.55) to display.
-        # Long entries mentioning a keyword in passing shouldn't dominate.
+        # Catches noise like "Telegram chat_id" showing up for "平安夜礼物".
         if r["pool"] in ("memory", "bank"):
             vs = r.get("vec_similarity") or 0
             r_content = ((r.get("content", "") or ""))[:150]
@@ -3133,25 +3134,23 @@ def surfacing_search(query: str, limit: int = 3) -> str:
     if not query:
         return ""
 
-    search_query, after, before = _extract_time_intent(query)
-    # When a time range is active, channels apply LIMIT before time filtering,
-    # so a small surfacing limit (3) leaves almost nothing after filtering.
-    # Same when context-filtering — we may need alternates to fall back to.
-    if (after or before) or current_session:
-        inner_limit = max(limit, 12)
-    else:
-        inner_limit = limit
-    # Same chunk-as-navigator logic as manual search: pull memory + bank +
-    # chunk. Surfacing's renderer keeps the chunk summary visible (the
-    # one-line recap helps the agent skim what each match is about) and
-    # then lists the chunk's top expanded messages as 原文截取 — manual
-    # search hides the summary and shows only originals.
+    # Social/status messages: short announcements of personal actions
+    # or greetings — no recall intent, skip surfacing.
+    if re.match(r"^(我去|我要去|去).{1,6}(了|啦|咯|去了)$", query):
+        return ""
+    if re.match(r"^(谢谢|感谢|多谢|辛苦|晚安|早安|拜拜|再见|回来了).{0,6}$", query):
+        return ""
+
+    # Surfacing ignores time extraction — when someone says "我今天又去
+    # 攀岩了", the valuable recall is climbing history (past), not today's
+    # messages. Time words provide context, not search constraints.
+    search_query, _, _ = _extract_time_intent(query)
+
+    inner_limit = max(limit, 12) if current_session else limit
     results = unified_search(
         search_query or query,
         limit=inner_limit,
         rerank=False,
-        after=after,
-        before=before,
         pools=["memory", "bank", "chunk"],
     )
     if not results:
@@ -3205,15 +3204,6 @@ def surfacing_search(query: str, limit: int = 3) -> str:
         if not results:
             return ""
 
-    # Pool-diversity guarantee: chunks are at a length disadvantage vs
-    # conv-message hits (a 200-char summary vs a 30-char raw line means the
-    # raw line wins on cosine even when both are about the same event), so
-    # straight global sort tends to crowd chunks out. But chunks carry the
-    # topic summary + expansion of representative messages — they're what
-    # makes a surfacing line *legible*. If no chunk made it into the limit
-    # naturally, swap in the best chunk from the remainder, replacing the
-    # lowest-scoring non-chunk in the kept set. Re-sort by score so the
-    # output still reads "best on top".
     top = results[:limit]
     if not any(r.get("pool") == "chunk" for r in top):
         fallback_chunk = next(
@@ -3230,29 +3220,51 @@ def surfacing_search(query: str, limit: int = 3) -> str:
                 top.sort(key=lambda r: r.get("score", 0), reverse=True)
     results = top
 
-    # Keyword precision gate: require at least one query keyword to appear
-    # in the top results. Pure-FTS hits without keyword overlap are noise
-    # (CJK character n-grams matching long entries). More reliable than
-    # vec_sim gating when the memory pool is small.
+    # Task-instruction skip: queries asking for help/search/how-to are
+    # not recall requests — skip surfacing entirely.
+    _task_q = search_query or query
+    if re.match(r"^(帮我|请|麻烦|你帮我).{0,6}(看|搜|查|找|写|改|做|修|算|翻译)", _task_q):
+        return ""
+    if re.search(r"怎么(写|做|用|弄|装|配|设)", _task_q):
+        return ""
+
+    # Keyword precision gate: require at least one meaningful query
+    # keyword to appear in the top results.
+    # Curated functional word list — words that never carry topic signal.
+    # Organized by linguistic category, not by test case.
+    # High-frequency corpus words are handled separately
+    # by filter_stopwords() from the DB stopwords table.
     _SURFACING_STOPS = {
-        "一下", "怎么", "什么", "这个", "那个", "可以", "一些", "一样",
-        "还是", "已经", "然后", "但是", "因为", "所以", "如果", "虽然",
-        "帮我", "一下", "看看", "想要", "一点", "比较", "应该", "不是",
+        # Connectives / adverbs
+        "一下", "一些", "一样", "一点", "还是", "已经", "然后",
+        "但是", "因为", "所以", "如果", "虽然", "比较", "应该",
+        # Pronouns / demonstratives
+        "这个", "那个", "这些", "那些",
+        # Interrogative particles (question words, not topics)
+        "怎么", "什么", "怎么样", "怎样", "如何", "多少", "有没有",
+        # Modal / pragmatic particles (acknowledgments, giving up, etc.)
+        "可以", "好的", "收到", "算了", "不想", "不要", "不用",
+        # Action verbs without topic content
+        "帮我", "看看", "想要", "不是",
+        # English function words
+        "ok", "let", "me", "try", "the", "is", "it", "do", "and",
+        "yes", "no", "oh", "hi", "lol", "haha", "sure",
     }
     if _JIEBA_OK:
         from jieba import cut as _jcut
-        _q_raw = [w for w in _jcut(search_query or query) if len(w.strip()) >= 2 and len(set(w.strip())) > 1]
-        _q_terms = set(filter_stopwords([w for w in _q_raw if w not in _SURFACING_STOPS]))
+        _q_raw = [w for w in _jcut(_task_q) if len(w.strip()) >= 2 and len(set(w.strip())) > 1]
+        _q_terms = set(filter_stopwords([w for w in _q_raw if w.lower() not in _SURFACING_STOPS]))
     else:
-        _q_terms = set(w for w in (search_query or query).split() if len(w) >= 2)
-    if _q_terms:
-        _top_content = " ".join(
-            (r.get("content", "") or "") + " " + (r.get("summary", "") or "")
-            for r in results[:3]
-        )
-        _matched = sum(1 for t in _q_terms if t in _top_content)
-        if _matched == 0:
-            return ""
+        _q_terms = set(w for w in _task_q.split() if len(w) >= 2 and w.lower() not in _SURFACING_STOPS)
+    if not _q_terms:
+        return ""
+    _top_content = " ".join(
+        (r.get("content", "") or "") + " " + (r.get("summary", "") or "")
+        for r in results[:3]
+    )
+    _matched = sum(1 for t in _q_terms if t in _top_content)
+    if _matched == 0:
+        return ""
 
     lines = []
     locale = os.environ.get("IMPRINT_LOCALE", "en")
@@ -3397,7 +3409,7 @@ timeline — 问"总体回顾/大事记/梳理时间线/都经历了什么"，�
   ✗ "最近聊了什么"（只问近期，不是全局回顾）
 
 none — 普通搜索，向量相似度就够了。这是默认值，不确定就选 none。
-  ✓ "hobbies" "what to eat" "birthday" "photos"
+  ✓ "攀岩" "吃什么" "生日" "拉屎" "照片"
 
 搜索词：{query}
 意图："""
