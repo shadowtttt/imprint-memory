@@ -18,7 +18,7 @@ from typing import Optional
 
 from .db import (
     _get_db, now_local, now_str,
-    DAILY_LOG_DIR, BANK_DIR, MEMORY_INDEX, LOCAL_TZ,
+    DATA_DIR, DAILY_LOG_DIR, BANK_DIR, MEMORY_INDEX, LOCAL_TZ,
     segment_cjk, sanitize_fts_query,
     _CJK_RE, _JIEBA_OK,
 )
@@ -2884,7 +2884,14 @@ def unified_search_text(
     seen_em_sigs: set[tuple[str, str]] = set()
 
     top_score = max((r.get("score", 0) for r in results), default=0)
-    display_floor = max(top_score * 0.4, 0.15)
+    display_floor = max(top_score * 0.55, 0.15)
+    display_floor_strict = max(top_score * 0.72, 0.15)
+
+    if _JIEBA_OK:
+        from jieba import cut as _jcut
+        _query_kw = set(w for w in _jcut(query) if len(w.strip()) >= 2 and len(set(w.strip())) > 1)
+    else:
+        _query_kw = set(query.split())
 
     for r in results:
         label = _labels.get(r["pool"], r["pool"])
@@ -2897,8 +2904,24 @@ def unified_search_text(
             edge_lines.append(f"[Memory|edge|{rel}] {content}")
             continue
 
-        if score <= 0 or score < display_floor:
+        pool_floor = display_floor_strict if r["pool"] in ("memory", "bank") else display_floor
+        if score <= 0 or score < pool_floor:
             continue
+
+        # Filter system guides from bank results — they match on example
+        # code snippets in documentation, not actual content.
+        if r["pool"] == "bank" and "guide" in (r.get("source", "") or ""):
+            continue
+
+        # For memory/bank without keyword overlap in the first 150 chars,
+        # require strong semantic signal (vec_sim > 0.55) to display.
+        # Long entries mentioning a keyword in passing shouldn't dominate.
+        if r["pool"] in ("memory", "bank"):
+            vs = r.get("vec_similarity") or 0
+            r_content = ((r.get("content", "") or ""))[:150]
+            _has_kw = any(t in r_content for t in _query_kw) if _query_kw else True
+            if not _has_kw and vs < 0.55:
+                continue
 
         if r["pool"] == "memory":
             cat = r.get("category", "")
@@ -2928,7 +2951,7 @@ def unified_search_text(
             # to a different chunk. Dedup by (speaker, content) still
             # applies — same line repeated 3-4x collapses to one.
             chunk_lines: list[str] = []
-            for em in r.get("expanded", []):
+            for em in r.get("expanded", [])[:3]:
                 raw = em.get("content", "") or ""
                 em_text = _clean_msg_for_display(raw)
                 if len(em_text) < 5:
@@ -3093,6 +3116,14 @@ def surfacing_search(query: str, limit: int = 3) -> str:
         return ""
 
     current_session = (os.environ.get("IMPRINT_CURRENT_SESSION_ID") or "").strip()
+
+    # Session-level dedup: don't re-surface the same memory/chunk twice.
+    _surfaced_dir = DATA_DIR / ".surfaced"
+    _surfaced_file = (_surfaced_dir / f"{current_session}.ids") if current_session else None
+    _seen_surfaced: set[str] = set()
+    if _surfaced_file and _surfaced_file.exists():
+        _seen_surfaced = set(_surfaced_file.read_text().split())
+
     # Strip channel-adapter prefixes.
     query = re.sub(r"\[当前对话窗口:[^\]]*\]", "", query)
     query = re.sub(r"\[\d{4}-\d{2}-\d{2}[^\]]*\]", "", query)
@@ -3199,6 +3230,30 @@ def surfacing_search(query: str, limit: int = 3) -> str:
                 top.sort(key=lambda r: r.get("score", 0), reverse=True)
     results = top
 
+    # Keyword precision gate: require at least one query keyword to appear
+    # in the top results. Pure-FTS hits without keyword overlap are noise
+    # (CJK character n-grams matching long entries). More reliable than
+    # vec_sim gating when the memory pool is small.
+    _SURFACING_STOPS = {
+        "一下", "怎么", "什么", "这个", "那个", "可以", "一些", "一样",
+        "还是", "已经", "然后", "但是", "因为", "所以", "如果", "虽然",
+        "帮我", "一下", "看看", "想要", "一点", "比较", "应该", "不是",
+    }
+    if _JIEBA_OK:
+        from jieba import cut as _jcut
+        _q_raw = [w for w in _jcut(search_query or query) if len(w.strip()) >= 2 and len(set(w.strip())) > 1]
+        _q_terms = set(filter_stopwords([w for w in _q_raw if w not in _SURFACING_STOPS]))
+    else:
+        _q_terms = set(w for w in (search_query or query).split() if len(w) >= 2)
+    if _q_terms:
+        _top_content = " ".join(
+            (r.get("content", "") or "") + " " + (r.get("summary", "") or "")
+            for r in results[:3]
+        )
+        _matched = sum(1 for t in _q_terms if t in _top_content)
+        if _matched == 0:
+            return ""
+
     lines = []
     locale = os.environ.get("IMPRINT_LOCALE", "en")
     mem_label = "记忆" if locale == "zh" else "Memory"
@@ -3224,9 +3279,15 @@ def surfacing_search(query: str, limit: int = 3) -> str:
         lines.append(f"   原文截取：{sp}: {body}{img}")
 
     idx = 0  # 1-based item counter for chunk/memory/conv hits
+    _newly_surfaced: list[str] = []
     for r in results:
         if r.get("score", 0) <= 0 or r.get("source") == "edge":
             continue
+        rid = str(r.get("id", ""))
+        if rid and rid in _seen_surfaced:
+            continue
+        if rid:
+            _newly_surfaced.append(rid)
         idx += 1
 
         if r["pool"] == "memory":
@@ -3267,6 +3328,13 @@ def surfacing_search(query: str, limit: int = 3) -> str:
     graph_lines = _intent_graph_surfacing(query, results)
     if graph_lines:
         lines.extend(graph_lines)
+
+    # Persist newly surfaced IDs for session dedup.
+    if _surfaced_file and _newly_surfaced:
+        _surfaced_dir.mkdir(parents=True, exist_ok=True)
+        with _surfaced_file.open("a") as f:
+            for rid in _newly_surfaced:
+                f.write(f"{rid}\n")
 
     return "\n".join(lines)
 
@@ -3329,7 +3397,7 @@ timeline — 问"总体回顾/大事记/梳理时间线/都经历了什么"，�
   ✗ "最近聊了什么"（只问近期，不是全局回顾）
 
 none — 普通搜索，向量相似度就够了。这是默认值，不确定就选 none。
-  ✓ "攀岩" "吃什么" "生日" "拉屎" "照片"
+  ✓ "hobbies" "what to eat" "birthday" "photos"
 
 搜索词：{query}
 意图："""

@@ -1,6 +1,6 @@
 [project]
 name = "imprint-memory"
-version = "0.3.0"
+version = "0.3.2"
 description = "Automatic memory layer for any LLM agent — captures every conversation turn, multimodal embed (text+image), hybrid search (vec + FTS5 + RRF), auto-surfacing recall hook. MCP server (stdio + HTTP)."
 readme = "README.md"
 license = "MIT"
