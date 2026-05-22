@@ -2396,8 +2396,8 @@ def _expand_via_edges(results: list[dict], db, max_expand: int = 3) -> list[dict
 
 # ─── Query Expansion ─────────────────────────────────────
 
-_EXPAND_PROMPT = """这是一对情侣的聊天记录搜索。用户搜：{query}
-想想实际对话中可能出现的口语表达和相关情境词（不要书面语）。输出5个逗号分隔的词："""
+_EXPAND_PROMPT = """This is a personal chat history search. Query: {query}
+Think of colloquial expressions and related context words that might appear in real conversations (not formal writing). Output 5 comma-separated words:"""
 
 
 def _expand_query(query: str) -> str:
