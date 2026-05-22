@@ -3242,6 +3242,8 @@ def surfacing_search(query: str, limit: int = 3) -> str:
         "这个", "那个", "这些", "那些",
         # Interrogative particles (question words, not topics)
         "怎么", "什么", "怎么样", "怎样", "如何", "多少", "有没有",
+        # Interjections
+        "哎呀", "哎", "呀", "唉", "嘛", "喔", "哇",
         # Modal / pragmatic particles (acknowledgments, giving up, etc.)
         "可以", "好的", "收到", "算了", "不想", "不要", "不用",
         # Action verbs without topic content
@@ -3250,12 +3252,15 @@ def surfacing_search(query: str, limit: int = 3) -> str:
         "ok", "let", "me", "try", "the", "is", "it", "do", "and",
         "yes", "no", "oh", "hi", "lol", "haha", "sure",
     }
+    # Note: don't use filter_stopwords() here — its fallback (return
+    # terms[:1] when all filtered) defeats the empty-keyword guard.
+    _db_stops = get_stopwords()
     if _JIEBA_OK:
         from jieba import cut as _jcut
         _q_raw = [w for w in _jcut(_task_q) if len(w.strip()) >= 2 and len(set(w.strip())) > 1]
-        _q_terms = set(filter_stopwords([w for w in _q_raw if w.lower() not in _SURFACING_STOPS]))
+        _q_terms = set(w for w in _q_raw if w.lower() not in _SURFACING_STOPS and w.lower() not in _db_stops)
     else:
-        _q_terms = set(w for w in _task_q.split() if len(w) >= 2 and w.lower() not in _SURFACING_STOPS)
+        _q_terms = set(w for w in _task_q.split() if len(w) >= 2 and w.lower() not in _SURFACING_STOPS and w.lower() not in _db_stops)
     if not _q_terms:
         return ""
     _top_content = " ".join(
@@ -3264,7 +3269,14 @@ def surfacing_search(query: str, limit: int = 3) -> str:
     )
     _matched = sum(1 for t in _q_terms if t in _top_content)
     if _matched == 0:
-        return ""
+        # Fallback: try expanded synonyms. "平安夜" → "圣诞节" bridging.
+        _expanded = _expand_query(_task_q)
+        if _expanded != _task_q:
+            _exp_raw = [w for w in _jcut(_expanded) if len(w.strip()) >= 2 and len(set(w.strip())) > 1] if _JIEBA_OK else _expanded.split()
+            _exp_terms = set(w for w in _exp_raw if w.lower() not in _SURFACING_STOPS and w.lower() not in _db_stops)
+            _matched = sum(1 for t in _exp_terms if t in _top_content)
+        if _matched == 0:
+            return ""
 
     lines = []
     locale = os.environ.get("IMPRINT_LOCALE", "en")
