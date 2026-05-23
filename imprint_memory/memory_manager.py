@@ -2444,12 +2444,16 @@ def unified_search(
     _internal: bool = False,
     rerank: bool = True,
 ) -> list[dict]:
-    """Search across all memory pools with RRF fusion and per-pool reranking.
+    """Search across memory pools with RRF fusion and per-pool reranking.
 
     Args:
         query:    natural-language search query
         limit:    max results to return
-        pools:    subset of ["memory", "bank", "conversation"]; None = all
+        pools:    subset of ["memory", "bank", "chunk", "conversation"]; None = ["memory", "bank", "chunk"]
+                  - memory: curated facts extracted by the extractor
+                  - bank:   markdown notes under memory/bank/
+                  - chunk:  conversation chunks (index layer; hits expand to raw messages)
+                  - conversation: raw conversation_log rows (opt-in; used by conversation_search)
         category: filter memory pool by category
         platform: filter conversation pool by platform
         _internal: skip side-effects (recalled_count, last_accessed_at) — for edge expansion

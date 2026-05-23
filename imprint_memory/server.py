@@ -75,7 +75,10 @@ def memory_remember(content: str, category: str = "facts", source: str = "cc", i
 
 @mcp.tool()
 def memory_search(query: str, limit: int = 10, after: Optional[str] = None, before: Optional[str] = None) -> str:
-    """Search across all memory pools (memories, knowledge bank, conversations) using RRF fusion.
+    """Search across memory pools (memories, knowledge bank, conversation chunks) using RRF fusion.
+    Default pools: ["memory", "bank", "chunk"]. Chunks are an index over the raw conversation log —
+    chunk hits expand into their top-ranked raw messages, so you see originals not summaries.
+    If this returns nothing relevant, fall back to conversation_search (raw conversation_log FTS).
     Combines FTS5 keyword, vector semantic, and exact-match channels with per-pool reranking.
     Falls back to keyword-only if no embedding provider is configured.
     after/before: ISO date strings to filter by time range (e.g. '2026-04-01' or '2026-04-01T10:00:00')."""
