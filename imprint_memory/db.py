@@ -37,6 +37,11 @@ _CJK_RE = re.compile(
 try:
     import jieba as _jieba
     _jieba.setLogLevel(20)
+    _userdict = DATA_DIR / "userdict_emotional.txt"
+    if not _userdict.exists():
+        _userdict = Path(__file__).parent / "data" / "userdict_emotional.txt"
+    if _userdict.exists():
+        _jieba.load_userdict(str(_userdict))
     _JIEBA_OK = True
 except ImportError:
     _JIEBA_OK = False
