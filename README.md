@@ -391,7 +391,7 @@ Built on top of these open-source libraries:
 
 ## License
 
-MIT
+[AGPL-3.0](LICENSE) — free for personal use; commercial use requires open-sourcing your entire project under AGPL.
 
 ---
 
@@ -743,4 +743,4 @@ pytest
 
 ## 许可证
 
-MIT
+[AGPL-3.0](LICENSE) — 个人使用免费；商业使用须将整个项目以 AGPL 开源。
