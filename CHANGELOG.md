@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.8 — 2026-05-24
+
+Two-step search guidance + chunker keeps external system names.
+
+- README documents the two-step search fallback (`memory_search` →
+  `conversation_search`) with a copy-pasteable CLAUDE.md snippet. Without
+  this hint LLMs commonly stop after the first miss even though the raw
+  conversation_log still has 20+ matching messages.
+- `conversation_chunker.SUMMARIZE_PROMPT` now requires the chunker to keep
+  external system names (frameworks, papers, GitHub repos) in `entities`
+  and reference them by name in `recap`. Previously the LLM summarizer
+  routinely dropped proper nouns, leaving research/comparison threads
+  unsearchable by keyword.
+- `memory_search` / `unified_search` docstrings clarify the default pools
+  are `["memory", "bank", "chunk"]`, explain that chunk hits expand into
+  raw messages, and point to `conversation_search` as the fallback path.
+
 ## 0.2.1 — 2026-05-20
 
 Docs-only release that gets the new architecture diagram + restructured
